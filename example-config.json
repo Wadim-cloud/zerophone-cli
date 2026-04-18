@@ -1,0 +1,6 @@
+{
+  "network_id": "your-zerotier-network-id",
+  "node_id": "your-zerotier-node-id",
+  "name": "Your Display Name",
+  "server_addr": "http://localhost:8080"
+}

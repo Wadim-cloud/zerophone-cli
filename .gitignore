@@ -1,0 +1,4 @@
+zerophone-cli
+*.db
+*.log
+.DS_Store
