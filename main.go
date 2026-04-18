@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -134,6 +135,20 @@ func (c *Client) GetNodes(networkID string) ([]Node, error) {
 	}
 
 	return nodes, nil
+}
+
+func (c *Client) DeleteNode(nodeID string) error {
+	req, _ := http.NewRequest("DELETE", c.BaseURL+"/nodes/"+nodeID, nil)
+	resp, err := c.HTTPClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNoContent {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("delete failed: HTTP %d: %s", resp.StatusCode, string(body))
+	}
+	return nil
 }
 
 func (c *Client) Register(req RegisterRequest) (*Node, error) {
@@ -279,7 +294,6 @@ type App struct {
 	errMsg      string
 	callTimer   *time.Ticker
 	callSecs    int
-	oldState    *term.State
 }
 
 type CallInfo struct {
@@ -293,6 +307,30 @@ const (
 	StateCalling
 	StateInCall
 	StateIncoming
+)
+
+const (
+	colorReset  = "\033[0m"
+	colorRed    = "\033[31m"
+	colorGreen  = "\033[32m"
+	colorYellow = "\033[33m"
+	colorBlue   = "\033[34m"
+	colorPurple = "\033[35m"
+	colorCyan   = "\033[36m"
+	colorWhite  = "\033[37m"
+	colorGray   = "\033[90m"
+	colorBold   = "\033[1m"
+)
+
+var (
+	styleTitle    = colorCyan + colorBold
+	styleHeader   = colorPurple
+	styleOnline   = colorGreen
+	styleOffline  = colorGray
+	styleSelected = colorYellow + colorBold
+	styleError    = colorRed
+	styleSuccess  = colorGreen
+	styleMuted    = colorGray
 )
 
 func NewApp(client *Client, cfg *Config) *App {
@@ -323,9 +361,9 @@ func (a *App) Register(nodeID, name, networkID string) {
 	}
 	registered, err := a.client.Register(node)
 	if err != nil {
-		a.errMsg = "Register failed: " + err.Error()
+		a.errMsg = "Registration failed: " + err.Error()
 	} else {
-		a.statusMsg = "Registered as " + registered.Name
+		a.statusMsg = "✓ Registered as " + registered.Name
 		a.config.Save()
 		go a.fetchNodes()
 	}
@@ -348,10 +386,30 @@ func (a *App) fetchNodes() {
 			}
 		}
 		if online == 0 {
-			a.statusMsg = "No nodes online"
+			a.statusMsg = "No other nodes online"
 		} else {
-			a.statusMsg = fmt.Sprintf("%d node(s) online", online)
+			a.statusMsg = fmt.Sprintf("✓ %d node(s) online", online)
 		}
+	}
+	a.statusTime = time.Now().Add(2 * time.Second)
+}
+
+func (a *App) DeleteSelectedNode() {
+	node := a.getSelected()
+	if node == nil {
+		return
+	}
+	if node.Status == "online" {
+		a.errMsg = "Cannot delete online nodes"
+		a.statusTime = time.Now().Add(2 * time.Second)
+		return
+	}
+	err := a.client.DeleteNode(node.ID)
+	if err != nil {
+		a.errMsg = "Delete failed: " + err.Error()
+	} else {
+		a.statusMsg = "✓ Node deleted"
+		go a.fetchNodes()
 	}
 	a.statusTime = time.Now().Add(2 * time.Second)
 }
@@ -376,12 +434,17 @@ func (a *App) getSelected() *Node {
 
 func (a *App) callSelected() {
 	if !a.isRegistered() {
-		a.errMsg = "Register first"
-		a.statusTime = time.Now().Add(2 * time.Second)
+		a.errMsg = "Register first (edit ~/.zerophone-cli.json)"
+		a.statusTime = time.Now().Add(3 * time.Second)
 		return
 	}
 	node := a.getSelected()
-	if node == nil || node.Status != "online" {
+	if node == nil {
+		return
+	}
+	if node.Status != "online" {
+		a.errMsg = "Node is offline"
+		a.statusTime = time.Now().Add(2 * time.Second)
 		return
 	}
 	a.state = StateCalling
@@ -393,7 +456,7 @@ func (a *App) callSelected() {
 		a.activeCall = nil
 		a.statusTime = time.Now().Add(3 * time.Second)
 	} else {
-		a.statusMsg = "Calling " + node.ID + "..."
+		a.statusMsg = " Calling " + node.Name + "... "
 		a.statusTime = time.Now().Add(5 * time.Second)
 	}
 }
@@ -448,18 +511,6 @@ func (a *App) setIncoming(from, callID string) {
 
 // =========== Rendering ===========
 
-const (
-	colorReset  = "\033[0m"
-	colorRed    = "\033[31m"
-	colorGreen  = "\033[32m"
-	colorYellow = "\033[33m"
-	colorBlue   = "\033[34m"
-	colorPurple = "\033[35m"
-	colorCyan   = "\033[36m"
-	colorWhite  = "\033[37m"
-	colorGray   = "\033[90m"
-)
-
 func clear() {
 	fmt.Print("\033[H\033[2J")
 }
@@ -467,20 +518,17 @@ func clear() {
 func (a *App) Render() {
 	clear()
 
-	// Header
-	status := colorGray + "[Disconnected]" + colorReset
-	if a.isRegistered() {
-		status = colorGreen + "[Connected]" + colorReset
-	}
-	fmt.Printf("%sZeroPhone CLI %s %s\n\n", colorCyan, status, colorReset)
+	// Header bar
+	fmt.Print(a.header())
+	fmt.Println()
 
-	// Incoming call overlay
+	// Incoming call
 	if a.incoming != nil {
 		a.renderIncoming()
 		fmt.Println()
 	}
 
-	// Active call overlay
+	// Active call bar
 	if a.activeCall != nil && a.state == StateInCall {
 		a.renderActiveCall()
 		fmt.Println()
@@ -493,91 +541,157 @@ func (a *App) Render() {
 		a.renderNodes()
 	}
 
-	// Status
+	// Footer with help
 	fmt.Println()
-	if time.Now().Before(a.statusTime) {
-		if a.errMsg != "" {
-			fmt.Printf("%s%s%s\n", colorRed, a.errMsg, colorReset)
-		} else if a.statusMsg != "" {
-			fmt.Printf("%s%s%s\n", colorGreen, a.statusMsg, colorReset)
-		}
+	a.renderFooter()
+}
+
+func (a *App) header() string {
+	status := styleMuted + "[Disconnected]" + colorReset
+	if a.isRegistered() {
+		status = styleSuccess + "[Online]" + colorReset
 	}
 
-	// Help
-	fmt.Printf("%s[r] Refresh  [↑↓] Select  [Enter] Call/End  [a] Answer  [R] Reject  [q] Quit%s\n", colorGray, colorReset)
+	title := styleTitle + " ZeroPhone CLI " + colorReset
+
+	// Build full header line
+	header := fmt.Sprintf("%s %s %s", title, status, colorReset)
+
+	return a.box(header, styleHeader)
 }
 
 func (a *App) renderRegister() {
-	fmt.Println(colorYellow + "  Not Registered" + colorReset)
+	fmt.Println(a.box(colorYellow+"  ╔═ Not Registered ╗"+colorReset, ""))
 	fmt.Println()
-	fmt.Println("  Set identity in ~/.zerophone-cli.json:")
+	fmt.Println("  Identity file: " + styleMuted + a.config.path + colorReset)
 	fmt.Println()
-	fmt.Printf("  %sNetwork ID:%s %s\n", colorGray, colorReset, defaultIfEmpty(a.config.NetworkID))
-	fmt.Printf("  %sNode ID:%s    %s\n", colorGray, colorReset, defaultIfEmpty(a.config.NodeID))
-	fmt.Printf("  %sName:%s       %s\n", colorGray, colorReset, defaultIfEmpty(a.config.Name))
+	fmt.Printf("  %sNetwork ID:%s  %s\n", styleMuted, colorReset, a.config.NetworkID)
+	fmt.Printf("  %sNode ID:%s     %s\n", styleMuted, colorReset, a.config.NodeID)
+	fmt.Printf("  %sName:%s        %s\n", styleMuted, colorReset, a.config.Name)
+	fmt.Println()
+	fmt.Println("  Edit the file above or use API to register.")
 	fmt.Println()
 	fmt.Println("  Example:")
-	fmt.Println(`  {`)
-	fmt.Println(`    "network_id": "a84ac5c123456789",`)
-	fmt.Println(`    "node_id": "your-zt-node-id",`)
-	fmt.Println(`    "name": "Your Name"`)
-	fmt.Println(`  }`)
-}
-
-func defaultIfEmpty(s string) string {
-	if s == "" {
-		return "<not set>"
-	}
-	return s
+	example := `  {
+    "network_id": "a84ac5c123456789",
+    "node_id": "your-zerotier-node-id",
+    "name": "Your Name"
+  }`
+	fmt.Println(styleMuted + example + colorReset)
 }
 
 func (a *App) renderNodes() {
-	header := fmt.Sprintf("Nodes on %s", a.config.NetworkID)
-	fmt.Println(colorCyan + header + colorReset)
-	fmt.Println()
-
 	filtered := a.filterNodes()
 	onlineCount := 0
+	offlineCount := 0
 	for _, n := range filtered {
 		if n.Status == "online" {
 			onlineCount++
+		} else {
+			offlineCount++
 		}
 	}
+
+	// Header
+	header := fmt.Sprintf(" Nodes on %s ", a.config.NetworkID)
+	fmt.Println(a.box(styleHeader+header+colorReset, styleHeader))
+	fmt.Println()
 
 	if len(filtered) == 0 {
-		fmt.Println(colorGray + "  No other nodes discovered" + colorReset)
-	} else {
-		for i, node := range filtered {
-			sel := "  "
-			if i == a.selectedIdx {
-				sel = colorYellow + "▶ " + colorReset
-			}
-
-			status := colorGray + "offline" + colorReset
-			if node.Status == "online" {
-				status = colorGreen + "online " + colorReset
-			}
-
-			id := truncate(node.ID, 12)
-			name := truncate(node.Name, 20)
-			fmt.Printf("%s%s  %-20s  %s\n", sel, colorPurple+id+colorReset, name, status)
-		}
+		fmt.Println(a.center("No other nodes discovered"))
+		return
 	}
-	fmt.Printf("\n  %sTotal: %d, Online: %d%s\n", colorGray, len(filtered), onlineCount, colorReset)
+
+	// Column headers
+	fmt.Printf("  %s  %-20s  %-20s  %s\n", styleSelected+"▶"+colorReset, "Name", "Node ID", "Status")
+	fmt.Println(strings.Repeat("─", 70))
+
+	for i, node := range filtered {
+		sel := "  "
+		if i == a.selectedIdx {
+			sel = styleSelected + "▶" + colorReset
+		}
+
+		name := truncate(node.Name, 20)
+		id := truncate(node.ID, 20)
+
+		var status string
+		switch node.Status {
+		case "online":
+			status = styleOnline + "● online" + colorReset
+		default:
+			status = styleOffline + "○ offline" + colorReset
+		}
+
+		fmt.Printf("%s  %-20s  %-20s  %s\n", sel, name, id, status)
+	}
+
+	// Summary
+	fmt.Println()
+	summary := fmt.Sprintf("%d total  %s%d online%s  %s%d offline%s",
+		len(filtered),
+		styleSuccess, onlineCount, colorReset,
+		styleMuted, offlineCount, colorReset,
+	)
+	fmt.Println(a.center(summary))
 }
 
 func (a *App) renderActiveCall() {
-	fmt.Println(colorGreen + "  ╔═ Active Call ╗" + colorReset)
-	fmt.Printf("  %sWith:%s %s\n", colorGray, colorReset, a.activeCall.To)
-	fmt.Printf("  %sTime:%s %s\n", colorGray, colorReset, a.formatDuration(a.callSecs))
-	fmt.Println("  " + colorGray + "[Press Enter to end call]" + colorReset)
+	line := fmt.Sprintf(" ╔═ Active Call with %s ─── %s ", a.activeCall.To, a.formatDuration(a.callSecs))
+	fmt.Println(a.box(line, styleSuccess))
+	fmt.Println()
+	fmt.Println("  Press [Enter] to end the call")
 }
 
 func (a *App) renderIncoming() {
-	fmt.Println(colorYellow + "  ╔═ Incoming Call ╗" + colorReset)
-	fmt.Printf("  %sFrom:%s %s\n", colorGray, colorReset, a.incoming.From)
+	fmt.Println(a.box(colorYellow+"  ╔═ Incoming Call ╗  from "+a.incoming.From+colorReset, colorYellow))
 	fmt.Println()
-	fmt.Printf("  [a] %sAnswer%s   [r] %sReject%s\n", colorGreen, colorReset, colorRed, colorReset)
+	fmt.Printf("  [a] %sAnswer%s    [r] %sReject%s    [d] %sDelete Node%s\n",
+		styleSuccess, colorReset,
+		styleError, colorReset,
+		styleError, colorReset)
+}
+
+func (a *App) renderFooter() {
+	now := time.Now().Format("15:04:05")
+	timeStr := styleMuted + now + colorReset
+
+	// Status message (temp)
+	statusLine := ""
+	if time.Now().Before(a.statusTime) {
+		if a.errMsg != "" {
+			statusLine = styleError + a.errMsg + colorReset
+		} else if a.statusMsg != "" {
+			statusLine = styleSuccess + a.statusMsg + colorReset
+		}
+	}
+
+	// Build help
+	help := styleMuted + "[↑↓]Select  [Enter]Call/End  [a]Ans  [R]Rej  [d]Del  [r]Ref  [q]Quit" + colorReset
+
+	fmt.Print(a.box(statusLine+"  "+help, styleMuted))
+	if statusLine != "" {
+		fmt.Println()
+		fmt.Print(a.box("  "+timeStr, styleMuted))
+	} else {
+		fmt.Print(a.box("  "+timeStr+"  "+help, styleMuted))
+	}
+}
+
+func (a *App) box(text string, style string) string {
+	if style == "" {
+		return " " + text + " "
+	}
+	return style + " " + text + " " + colorReset
+}
+
+func (a *App) center(s string) string {
+	width := 70
+	if len(s) < width {
+		pad := (width - len(s)) / 2
+		return strings.Repeat(" ", pad) + s
+	}
+	return s
 }
 
 func (a *App) formatDuration(s int) string {
@@ -590,14 +704,13 @@ func truncate(s string, n int) string {
 	if len(s) <= n {
 		return s
 	}
-	return s[:n-3] + "..."
+	return s[:n-2] + ".."
 }
 
 // =========== Main Loop ===========
 
 func (a *App) Run() {
 	oldState, _ := term.MakeRaw(int(os.Stdin.Fd()))
-	a.oldState = oldState
 	defer term.Restore(int(os.Stdin.Fd()), oldState)
 
 	// Handle resize
@@ -605,7 +718,7 @@ func (a *App) Run() {
 	signal.Notify(sigChan, syscall.SIGWINCH)
 	go func() {
 		for range sigChan {
-			// terminal resized
+			// Redraw will happen in ticker
 		}
 	}()
 
@@ -634,11 +747,11 @@ func (a *App) Run() {
 		}()
 	}
 
-	// Render loop
-	ticker := time.NewTicker(100 * time.Millisecond)
+	// Render loop (30 FPS)
+	ticker := time.NewTicker(33 * time.Millisecond)
 	defer ticker.Stop()
 
-	for !a.quit() {
+	for {
 		select {
 		case <-ticker.C:
 			a.Render()
@@ -648,19 +761,13 @@ func (a *App) Run() {
 			// ws closed
 		}
 	}
-
-	// Cleanup
-	if a.callTimer != nil {
-		a.callTimer.Stop()
-	}
-	clear()
-	fmt.Println("Goodbye!")
 }
 
 func (a *App) handleKey(b byte) {
 	switch b {
 	case 'q', 3: // ctrl+c
-		a.quitApp()
+		clear()
+		os.Exit(0)
 	case 'r':
 		a.fetchNodes()
 	case 13: // Enter
@@ -668,7 +775,6 @@ func (a *App) handleKey(b byte) {
 			a.callSelected()
 		} else if a.state == StateInCall {
 			a.endCall()
-			a.Render()
 		}
 	case 'a':
 		if a.state == StateIncoming && a.incoming != nil {
@@ -678,16 +784,24 @@ func (a *App) handleKey(b byte) {
 		if a.state == StateIncoming && a.incoming != nil {
 			a.rejectCall(a.incoming.From, a.incoming.CallID)
 		}
-	case 0x1B: // ESC sequence start
-		// Read next bytes (arrow keys)
+	case 'd':
+		if a.state == StateBrowse {
+			a.DeleteSelectedNode()
+		}
+	case 0x1B: // ESC
 		b2 := readByte()
 		if b2 == '[' {
 			b3 := readByte()
+			filtered := a.filterNodes()
 			switch b3 {
 			case 'A': // up
-				a.selectedIdx = (a.selectedIdx - 1 + len(a.filterNodes())) % len(a.filterNodes())
+				if len(filtered) > 0 {
+					a.selectedIdx = (a.selectedIdx - 1 + len(filtered)) % len(filtered)
+				}
 			case 'B': // down
-				a.selectedIdx = (a.selectedIdx + 1) % len(a.filterNodes())
+				if len(filtered) > 0 {
+					a.selectedIdx = (a.selectedIdx + 1) % len(filtered)
+				}
 			}
 		}
 	}
@@ -719,7 +833,7 @@ func (a *App) handleWS(msg Message) {
 		}
 	case "CALL_REJECT":
 		if a.state == StateCalling {
-			a.errMsg = "Call rejected"
+			a.errMsg = "✗ Call rejected"
 			a.state = StateBrowse
 			a.activeCall = nil
 			a.statusTime = time.Now().Add(3 * time.Second)
@@ -731,19 +845,10 @@ func (a *App) handleWS(msg Message) {
 			if a.callTimer != nil {
 				a.callTimer.Stop()
 			}
-			a.statusMsg = "Call ended"
+			a.statusMsg = " Call ended "
 			a.statusTime = time.Now().Add(2 * time.Second)
 		}
 	}
-}
-
-func (a *App) quit() bool {
-	// Implement quit logic if needed
-	return false
-}
-
-func (a *App) quitApp() {
-	os.Exit(0)
 }
 
 // =========== Entry ===========

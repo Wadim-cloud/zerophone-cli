@@ -9,6 +9,7 @@ A terminal-based client for [ZeroPhone](https://github.com/Wadim-cloud/zerophone
 - Browse online/offline nodes on your ZeroTier network
 - Initiate voice calls with a single keypress
 - Answer/reject incoming calls from the terminal
+- **Delete offline nodes** from the network (press `d`)
 - Active call timer display
 - Real-time updates via WebSocket signaling
 - ANSI color output — no heavy TUI dependencies
@@ -17,12 +18,12 @@ A terminal-based client for [ZeroPhone](https://github.com/Wadim-cloud/zerophone
 ## Installation
 
 ```bash
-git clone https://github.com/your-org/zerophone-cli.git
+git clone https://github.com/Wadim-cloud/zerophone-cli.git
 cd zerophone-cli
 go build -o zerophone-cli .
 ```
 
-Or download a pre-built binary from [Releases](https://github.com/your-org/zerophone-cli/releases).
+Or download pre-built binaries from [Releases](https://github.com/Wadim-cloud/zerophone-cli/releases).
 
 ## Configuration
 
@@ -56,8 +57,18 @@ Once running:
 | `Enter` | Call selected / End active call |
 | `a` | Answer incoming call |
 | `R` (Shift+R) | Reject incoming call |
+| `d` | Delete offline node (when selected) |
 | `r` | Refresh node list |
 | `q` or `Ctrl+C` | Quit |
+
+## Node Deletion
+
+You can delete **offline nodes** from the network to keep your list clean:
+1. Navigate to an offline node with arrow keys
+2. Press `d`
+3. Node will be removed from the server and UI
+
+Online nodes cannot be deleted (they'll re-discover themselves).
 
 ## How It Works
 
@@ -69,7 +80,7 @@ Once running:
 6. When connected, press Enter to hang up
 
 The CLI uses:
-- **HTTP REST API** for registration, node listing, and signaling
+- **HTTP REST API** for registration, node listing, signaling, and node deletion
 - **WebSocket** for real-time incoming call notifications
 - **Long-polling fallback** if WebSocket is unavailable
 
@@ -78,11 +89,25 @@ The CLI uses:
 - Go 1.21+ (to build from source)
 - ZeroPhone server running and accessible
 - Terminal with ANSI color support
-- Microphone (forvoice calls — controlled by browser WebRTC when web client is used; CLI only manages signaling)
+- Microphone (for voice calls — controlled by browser WebRTC when web client is used; CLI only manages signaling)
 
-## Notes
+## Screenshot
 
-The CLI only handles signaling and call control. Actual audio is transmitted peer-to-peer via WebRTC in the browser client. This design allows the CLI to be lightweight and terminal-friendly.
+```
+  ZeroPhone CLI  [Online]   distributed VoIP
+
+  ┌─ Nodes on a84ac5c123456789 ────────────────┐
+  │                                            │
+  │  ▶ My-Laptop            online             │
+  │    Home-PC              offline            │
+  │    Phone-Android        online             │
+  │                                            │
+  │  Total: 3  Online: 2  Offline: 1           │
+  └────────────────────────────────────────────┘
+
+  [↑↓]Select  [Enter]Call/End  [a]Ans  [R]Rej  \
+  [d]Del  [r]Ref  [q]Quit  19:57:23
+```
 
 ## License
 
