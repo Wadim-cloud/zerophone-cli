@@ -948,6 +948,9 @@ func (a *App) Run() {
 		}
 	}()
 
+	// Initial render to show something immediately
+	a.render()
+
 	// Auto-connect if configured
 	if a.isRegistered() {
 		a.setStatus("Registered as " + a.cfg.Name)
@@ -958,6 +961,10 @@ func (a *App) Run() {
 	// Auto-refresh ticker
 	refreshTicker := time.NewTicker(time.Duration(a.cfg.refreshInt) * time.Second)
 	defer refreshTicker.Stop()
+
+	// Render ticker for periodic updates (30 FPS)
+	renderTicker := time.NewTicker(33 * time.Millisecond)
+	defer renderTicker.Stop()
 
 	// Event loop
 	for {
@@ -970,17 +977,20 @@ func (a *App) Run() {
 			if a.isRegistered() {
 				go a.fetchNodes()
 			}
+			a.render() // refresh display on ticker
+		case <-renderTicker.C:
+			a.render()
 		case event := <-a.eventChan:
 			switch ev := event.(type) {
 			case *tcell.EventResize:
 				a.screen.Sync()
+				a.render()
 			case *tcell.EventKey:
 				if ev.Key() == tcell.KeyCtrlC || ev.Key() == tcell.KeyEsc {
 					return
 				}
 				a.handleKey(ev)
 			}
-			a.render()
 		}
 	}
 }
