@@ -314,7 +314,7 @@ type App struct {
 
 	nodes       []Node
 	selectedIdx int
-	scrollIdx   int // for scrolling long lists
+	scrollIdx   int
 
 	activeCall *CallInfo
 	incoming   *CallInfo
@@ -328,6 +328,7 @@ type App struct {
 
 	screen      tcell.Screen
 	quit        chan struct{}
+	eventChan   chan tcell.Event
 	lastRefresh time.Time
 }
 
@@ -354,6 +355,7 @@ func NewApp(cfg *Config) *App {
 		errTime:     time.Now(),
 		screen:      screen,
 		quit:        make(chan struct{}),
+		eventChan:   make(chan tcell.Event, 100),
 		lastRefresh: time.Now(),
 	}
 }
@@ -934,6 +936,18 @@ func (a *App) Run() {
 		close(a.quit)
 	}()
 
+	// Start event reader goroutine
+	go func() {
+		for {
+			event := a.screen.PollEvent()
+			select {
+			case a.eventChan <- event:
+			case <-a.quit:
+				return
+			}
+		}
+	}()
+
 	// Auto-connect if configured
 	if a.isRegistered() {
 		a.setStatus("Registered as " + a.cfg.Name)
@@ -956,9 +970,7 @@ func (a *App) Run() {
 			if a.isRegistered() {
 				go a.fetchNodes()
 			}
-		default:
-			// Poll tcell events
-			event := a.screen.PollEvent()
+		case event := <-a.eventChan:
 			switch ev := event.(type) {
 			case *tcell.EventResize:
 				a.screen.Sync()
@@ -969,7 +981,6 @@ func (a *App) Run() {
 				a.handleKey(ev)
 			}
 			a.render()
-			time.Sleep(33 * time.Millisecond)
 		}
 	}
 }
