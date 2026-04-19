@@ -18,7 +18,7 @@ import (
 	"golang.org/x/term"
 )
 
-// =========== Types ===========
+// =========== Domain Types ===========
 
 type Node struct {
 	ID           string   `json:"id"`
@@ -54,26 +54,28 @@ type Message struct {
 	Payload interface{} `json:"payload,omitempty"`
 }
 
-// =========== Config ===========
+// =========== Configuration ===========
 
 type Config struct {
 	NetworkID  string `json:"network_id"`
 	NodeID     string `json:"node_id"`
 	Name       string `json:"name"`
 	ServerAddr string `json:"server_addr"`
-	path       string
+	configPath string
 }
 
 func NewConfig() *Config {
 	home, _ := os.UserHomeDir()
 	return &Config{
 		ServerAddr: "http://localhost:8080",
-		path:       filepath.Join(home, ".zerophone-cli.json"),
+		configPath: filepath.Join(home, ".zerophone-cli.json"),
 	}
 }
 
+func (c *Config) Path() string { return c.configPath }
+
 func (c *Config) Load() error {
-	data, err := os.ReadFile(c.path)
+	data, err := os.ReadFile(c.configPath)
 	if err != nil {
 		return err
 	}
@@ -85,31 +87,26 @@ func (c *Config) Save() error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(c.path, data, 0600)
+	return os.WriteFile(c.configPath, data, 0600)
 }
 
-// =========== API Client ===========
+// =========== HTTP Client ===========
 
-type Client struct {
-	BaseURL    string
-	HTTPClient *http.Client
-	NodeID     string
-	wsConn     *websocket.Conn
-	msgChan    chan Message
-	closeChan  chan struct{}
+type HTTPClient struct {
+	baseURL    string
+	httpClient *http.Client
+	nodeID     string
 }
 
-func NewClient(baseURL string) *Client {
-	return &Client{
-		BaseURL:    baseURL,
-		HTTPClient: &http.Client{Timeout: 10 * time.Second},
-		msgChan:    make(chan Message, 100),
-		closeChan:  make(chan struct{}),
+func NewHTTPClient(baseURL string) *HTTPClient {
+	return &HTTPClient{
+		baseURL:    baseURL,
+		httpClient: &http.Client{Timeout: 10 * time.Second},
 	}
 }
 
-func (c *Client) GetNodes(networkID string) ([]Node, error) {
-	resp, err := c.HTTPClient.Get(c.BaseURL + "/nodes?network_id=" + networkID)
+func (c *HTTPClient) GetNodes(networkID string) ([]Node, error) {
+	resp, err := c.httpClient.Get(c.baseURL + "/nodes?network_id=" + networkID)
 	if err != nil {
 		return nil, err
 	}
@@ -133,27 +130,26 @@ func (c *Client) GetNodes(networkID string) ([]Node, error) {
 			nodes[i].Status = "offline"
 		}
 	}
-
 	return nodes, nil
 }
 
-func (c *Client) DeleteNode(nodeID string) error {
-	req, _ := http.NewRequest("DELETE", c.BaseURL+"/nodes/"+nodeID, nil)
-	resp, err := c.HTTPClient.Do(req)
+func (c *HTTPClient) DeleteNode(nodeID string) error {
+	req, _ := http.NewRequest("DELETE", c.baseURL+"/nodes/"+nodeID, nil)
+	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNoContent {
 		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("delete failed: HTTP %d: %s", resp.StatusCode, string(body))
+		return fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(body))
 	}
 	return nil
 }
 
-func (c *Client) Register(req RegisterRequest) (*Node, error) {
+func (c *HTTPClient) Register(req RegisterRequest) (*Node, error) {
 	body, _ := json.Marshal(req)
-	resp, err := c.HTTPClient.Post(c.BaseURL+"/register", "application/json", bytes.NewReader(body))
+	resp, err := c.httpClient.Post(c.baseURL+"/register", "application/json", bytes.NewReader(body))
 	if err != nil {
 		return nil, err
 	}
@@ -168,24 +164,10 @@ func (c *Client) Register(req RegisterRequest) (*Node, error) {
 	if err := json.NewDecoder(resp.Body).Decode(&node); err != nil {
 		return nil, err
 	}
-	c.NodeID = node.ID
 	return &node, nil
 }
 
-func (c *Client) Heartbeat(nodeID string) error {
-	req, _ := http.NewRequest("POST", c.BaseURL+"/heartbeat?node_id="+nodeID, nil)
-	resp, err := c.HTTPClient.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("heartbeat failed: HTTP %d", resp.StatusCode)
-	}
-	return nil
-}
-
-func (c *Client) InitiateCall(fromID, toID string) error {
+func (c *HTTPClient) InitiateCall(fromID, toID string) error {
 	callID := fmt.Sprintf("call-%d", time.Now().UnixNano())
 	req := SignalRequest{
 		Type:   "CALL_REQUEST",
@@ -196,7 +178,7 @@ func (c *Client) InitiateCall(fromID, toID string) error {
 	return c.sendSignal(req)
 }
 
-func (c *Client) AnswerCall(fromID, toID, callID string) error {
+func (c *HTTPClient) AnswerCall(fromID, toID, callID string) error {
 	req := SignalRequest{
 		Type:   "CALL_ACCEPT",
 		FromID: fromID,
@@ -206,7 +188,7 @@ func (c *Client) AnswerCall(fromID, toID, callID string) error {
 	return c.sendSignal(req)
 }
 
-func (c *Client) RejectCall(fromID, toID, callID string) error {
+func (c *HTTPClient) RejectCall(fromID, toID, callID string) error {
 	req := SignalRequest{
 		Type:   "CALL_REJECT",
 		FromID: fromID,
@@ -216,7 +198,7 @@ func (c *Client) RejectCall(fromID, toID, callID string) error {
 	return c.sendSignal(req)
 }
 
-func (c *Client) EndCall(fromID, toID, callID string) error {
+func (c *HTTPClient) EndCall(fromID, toID, callID string) error {
 	req := SignalRequest{
 		Type:   "CALL_END",
 		FromID: fromID,
@@ -226,9 +208,9 @@ func (c *Client) EndCall(fromID, toID, callID string) error {
 	return c.sendSignal(req)
 }
 
-func (c *Client) sendSignal(req SignalRequest) error {
+func (c *HTTPClient) sendSignal(req SignalRequest) error {
 	body, _ := json.Marshal(req)
-	resp, err := c.HTTPClient.Post(c.BaseURL+"/signal", "application/json", bytes.NewReader(body))
+	resp, err := c.httpClient.Post(c.baseURL+"/signal", "application/json", bytes.NewReader(body))
 	if err != nil {
 		return err
 	}
@@ -240,29 +222,42 @@ func (c *Client) sendSignal(req SignalRequest) error {
 	return nil
 }
 
-func (c *Client) ConnectWebSocket(nodeID string) (<-chan Message, error) {
-	url := c.BaseURL + "/ws/" + nodeID
+// =========== WebSocket Client ===========
+
+type WSClient struct {
+	conn      *websocket.Conn
+	msgChan   chan Message
+	closeChan chan struct{}
+}
+
+func NewWSClient(baseURL string) *WSClient {
+	return &WSClient{
+		msgChan:   make(chan Message, 100),
+		closeChan: make(chan struct{}),
+	}
+}
+
+func (c *WSClient) Connect(baseURL, nodeID string) error {
+	url := baseURL + "/ws/" + nodeID
 	url = "ws" + url[4:]
 
 	conn, _, err := websocket.DefaultDialer.Dial(url, nil)
 	if err != nil {
-		return nil, err
+		return err
 	}
-	c.wsConn = conn
-
+	c.conn = conn
 	go c.readPump()
-	return c.msgChan, nil
+	return nil
 }
 
-func (c *Client) readPump() {
+func (c *WSClient) readPump() {
 	for {
 		var msg Message
-		if err := c.wsConn.ReadJSON(&msg); err != nil {
+		if err := c.conn.ReadJSON(&msg); err != nil {
 			if io.EOF == err {
 				close(c.closeChan)
-				return
 			}
-			continue
+			return
 		}
 		select {
 		case c.msgChan <- msg:
@@ -272,31 +267,26 @@ func (c *Client) readPump() {
 	}
 }
 
-func (c *Client) Close() error {
-	if c.wsConn != nil {
-		return c.wsConn.Close()
+func (c *WSClient) Messages() <-chan Message { return c.msgChan }
+func (c *WSClient) Closed() <-chan struct{}  { return c.closeChan }
+func (c *WSClient) Close() error {
+	if c.conn != nil {
+		return c.conn.Close()
 	}
 	return nil
 }
 
-// =========== TUI ===========
+// =========== Application State ===========
 
-type App struct {
-	client      *Client
-	config      *Config
-	state       int // 0=browse, 1=calling, 2=incall, 3=incoming
-	nodes       []Node
-	selectedIdx int
-	activeCall  *CallInfo
-	incoming    *CallInfo
-	statusMsg   string
-	statusTime  time.Time
-	errMsg      string
-	callTimer   *time.Ticker
-	callSecs    int
-	shouldQuit  chan struct{}
-	stdinChan   chan byte
-}
+type AppState int
+
+const (
+	StateBrowse AppState = iota
+	StateCalling
+	StateInCall
+	StateIncoming
+	StateError
+)
 
 type CallInfo struct {
 	CallID string
@@ -304,98 +294,97 @@ type CallInfo struct {
 	To     string
 }
 
-const (
-	StateBrowse = iota
-	StateCalling
-	StateInCall
-	StateIncoming
-)
+type App struct {
+	cfg   *Config
+	http  *HTTPClient
+	ws    *WSClient
+	state AppState
 
-const (
-	colorReset  = "\033[0m"
-	colorRed    = "\033[31m"
-	colorGreen  = "\033[32m"
-	colorYellow = "\033[33m"
-	colorBlue   = "\033[34m"
-	colorPurple = "\033[35m"
-	colorCyan   = "\033[36m"
-	colorWhite  = "\033[37m"
-	colorGray   = "\033[90m"
-	colorBold   = "\033[1m"
-)
+	nodes       []Node
+	selectedIdx int
 
-var (
-	styleTitle    = colorCyan + colorBold
-	styleHeader   = colorPurple
-	styleOnline   = colorGreen
-	styleOffline  = colorGray
-	styleSelected = colorYellow + colorBold
-	styleError    = colorRed
-	styleSuccess  = colorGreen
-	styleMuted    = colorGray
-)
+	activeCall *CallInfo
+	incoming   *CallInfo
+	callTimer  *time.Ticker
+	callSecs   int
 
-func NewApp(client *Client, cfg *Config) *App {
+	statusMsg  string
+	statusTime time.Time
+	errMsg     string
+	errTime    time.Time
+
+	shouldQuit chan struct{}
+	stdinChan  chan byte
+	renderTick <-chan time.Time
+}
+
+func NewApp(cfg *Config) *App {
+	client := NewHTTPClient(cfg.ServerAddr)
+	ws := NewWSClient(cfg.ServerAddr)
+
 	return &App{
-		client:     client,
-		config:     cfg,
+		cfg:        cfg,
+		http:       client,
+		ws:         ws,
 		state:      StateBrowse,
 		nodes:      []Node{},
-		statusTime: time.Now(),
 		shouldQuit: make(chan struct{}),
 		stdinChan:  make(chan byte, 100),
+		renderTick: time.NewTicker(33 * time.Millisecond).C,
 	}
 }
 
+// =========== Registration ===========
+
 func (a *App) isRegistered() bool {
-	return a.config.NodeID != "" && a.config.NetworkID != ""
+	return a.cfg.NodeID != "" && a.cfg.NetworkID != "" && a.cfg.Name != ""
 }
 
 func (a *App) Register(nodeID, name, networkID string) {
-	a.config.NodeID = nodeID
-	a.config.Name = name
-	a.config.NetworkID = networkID
-	_ = a.config.Save()
+	a.cfg.NodeID = nodeID
+	a.cfg.Name = name
+	a.cfg.NetworkID = networkID
+	_ = a.cfg.Save()
 
-	node := RegisterRequest{
+	req := RegisterRequest{
 		ID:           nodeID,
 		Name:         name,
 		NetworkID:    networkID,
 		Capabilities: []string{"audio"},
 	}
-	registered, err := a.client.Register(node)
+
+	registered, err := a.http.Register(req)
 	if err != nil {
-		a.errMsg = "Registration failed: " + err.Error()
+		a.setError("Registration failed: " + err.Error())
 	} else {
-		a.statusMsg = "Registered as " + registered.Name
-		a.config.Save()
+		a.http.nodeID = registered.ID
+		a.setStatus("Registered as " + registered.Name)
 		go a.fetchNodes()
+		go a.connectWS()
 	}
-	a.statusTime = time.Now().Add(3 * time.Second)
 }
 
 func (a *App) fetchNodes() {
-	if a.config.NetworkID == "" {
+	if a.cfg.NetworkID == "" {
 		return
 	}
-	nodes, err := a.client.GetNodes(a.config.NetworkID)
+	nodes, err := a.http.GetNodes(a.cfg.NetworkID)
 	if err != nil {
-		a.errMsg = "Fetch error: " + err.Error()
+		a.setError("Fetch error: " + err.Error())
 	} else {
 		a.nodes = nodes
 		online := 0
 		for _, n := range nodes {
-			if n.Status == "online" && n.ID != a.config.NodeID {
+			if n.Status == "online" && n.ID != a.cfg.NodeID {
 				online++
 			}
 		}
 		if online == 0 {
-			a.statusMsg = "No other nodes online"
+			a.setStatus("No other nodes online")
 		} else {
-			a.statusMsg = fmt.Sprintf("%d node(s) online", online)
+			a.setStatus(fmt.Sprintf("%d node(s) online", online))
 		}
 	}
-	a.statusTime = time.Now().Add(2 * time.Second)
 }
 
 func (a *App) DeleteSelectedNode() {
@@ -404,42 +393,41 @@ func (a *App) DeleteSelectedNode() {
 		return
 	}
 	if node.Status == "online" {
-		a.errMsg = "Cannot delete online nodes"
-		a.statusTime = time.Now().Add(2 * time.Second)
+		a.setError("Cannot delete online nodes")
 		return
 	}
-	err := a.client.DeleteNode(node.ID)
+	err := a.http.DeleteNode(node.ID)
 	if err != nil {
-		a.errMsg = "Delete failed: " + err.Error()
+		a.setError("Delete failed: " + err.Error())
 	} else {
-		a.statusMsg = "Node deleted"
+		a.setStatus("Node deleted")
 		go a.fetchNodes()
 	}
-	a.statusTime = time.Now().Add(2 * time.Second)
+}
+
+func (a *App) getSelected() *Node {
+	filtered := a.filterNodes()
+	if a.selectedIdx >= 0 && a.selectedIdx < len(filtered) {
+		return &filtered[a.selectedIdx]
+	}
+	return nil
 }
 
 func (a *App) filterNodes() []Node {
 	out := []Node{}
 	for _, n := range a.nodes {
-		if n.ID != a.config.NodeID {
+		if n.ID != a.cfg.NodeID {
 			out = append(out, n)
 		}
 	}
 	return out
 }
 
-func (a *App) getSelected() *Node {
-	f := a.filterNodes()
-	if a.selectedIdx >= 0 && a.selectedIdx < len(f) {
-		return &f[a.selectedIdx]
-	}
-	return nil
-}
+// =========== Calling ===========
 
 func (a *App) callSelected() {
 	if !a.isRegistered() {
-		a.errMsg = "Register first (edit ~/.zerophone-cli.json)"
-		a.statusTime = time.Now().Add(3 * time.Second)
+		a.setError("Register first (edit ~/.zerophone-cli.json)")
 		return
 	}
 	node := a.getSelected()
@@ -447,36 +435,55 @@ func (a *App) callSelected() {
 		return
 	}
 	if node.Status != "online" {
-		a.errMsg = "Node is offline"
-		a.statusTime = time.Now().Add(2 * time.Second)
+		a.setError("Node is offline")
 		return
 	}
 	a.state = StateCalling
-	a.activeCall = &CallInfo{From: a.config.NodeID, To: node.ID}
-	err := a.client.InitiateCall(a.config.NodeID, node.ID)
+	a.activeCall = &CallInfo{From: a.cfg.NodeID, To: node.ID}
+	err := a.http.InitiateCall(a.cfg.NodeID, node.ID)
 	if err != nil {
-		a.errMsg = "Call error: " + err.Error()
+		a.setError("Call error: " + err.Error())
 		a.state = StateBrowse
 		a.activeCall = nil
-		a.statusTime = time.Now().Add(3 * time.Second)
 	} else {
-		a.statusMsg = "Calling " + node.Name + "..."
-		a.statusTime = time.Now().Add(5 * time.Second)
+		a.setStatus("Calling " + node.Name + "...")
 	}
 }
 
 func (a *App) answerCall(from, callID string) {
 	a.state = StateInCall
 	a.incoming = nil
-	a.activeCall = &CallInfo{CallID: callID, From: from, To: a.config.NodeID}
-	err := a.client.AnswerCall(a.config.NodeID, from, callID)
+	a.activeCall = &CallInfo{CallID: callID, From: from, To: a.cfg.NodeID}
+	err := a.http.AnswerCall(a.cfg.NodeID, from, callID)
 	if err != nil {
-		a.errMsg = "Answer failed: " + err.Error()
+		a.setError("Answer failed: " + err.Error())
 		a.state = StateBrowse
 		a.activeCall = nil
-		a.statusTime = time.Now().Add(3 * time.Second)
 		return
 	}
+	a.startCallTimer()
+}
+
+func (a *App) rejectCall(from, callID string) {
+	_ = a.http.RejectCall(a.cfg.NodeID, from, callID)
+	a.incoming = nil
+	a.state = StateBrowse
+}
+
+func (a *App) endCall() {
+	if a.activeCall == nil {
+		return
+	}
+	_ = a.http.EndCall(a.cfg.NodeID, a.activeCall.To, a.activeCall.CallID)
+	a.activeCall = nil
+	if a.callTimer != nil {
+		a.callTimer.Stop()
+	}
+	a.state = StateBrowse
+	a.callSecs = 0
+}
+
+func (a *App) startCallTimer() {
 	a.callSecs = 0
 	a.callTimer = time.NewTicker(1 * time.Second)
 	go func() {
@@ -489,31 +496,95 @@ func (a *App) answerCall(from, callID string) {
 	}()
 }
 
-func (a *App) rejectCall(from, callID string) {
-	_ = a.client.RejectCall(a.config.NodeID, from, callID)
-	a.incoming = nil
-	a.state = StateBrowse
-}
-
-func (a *App) endCall() {
-	if a.activeCall == nil {
-		return
-	}
-	_ = a.client.EndCall(a.config.NodeID, a.activeCall.To, a.activeCall.CallID)
-	a.activeCall = nil
-	if a.callTimer != nil {
-		a.callTimer.Stop()
-	}
-	a.state = StateBrowse
-	a.callSecs = 0
-}
-
 func (a *App) setIncoming(from, callID string) {
 	a.incoming = &CallInfo{From: from, CallID: callID}
 	a.state = StateIncoming
 }
 
+// =========== WebSocket Handling ===========
+
+func (a *App) connectWS() {
+	if !a.isRegistered() {
+		return
+	}
+	_ = a.ws.Connect(a.cfg.ServerAddr, a.cfg.NodeID)
+	go func() {
+		for msg := range a.ws.Messages() {
+			a.handleWS(msg)
+		}
+	}()
+}
+
+func (a *App) handleWS(msg Message) {
+	switch msg.Type {
+	case "CALL_REQUEST":
+		a.setIncoming(msg.FromID, msg.CallID)
+	case "CALL_ACCEPT":
+		if a.state == StateCalling && a.activeCall != nil {
+			a.state = StateInCall
+			a.startCallTimer()
+		}
+	case "CALL_REJECT":
+		if a.state == StateCalling {
+			a.setError("Call rejected")
+			a.state = StateBrowse
+			a.activeCall = nil
+		}
+	case "CALL_END":
+		if a.state == StateInCall || a.state == StateCalling {
+			a.state = StateBrowse
+			a.activeCall = nil
+			if a.callTimer != nil {
+				a.callTimer.Stop()
+			}
+			a.setStatus("Call ended")
+		}
+	}
+}
+
+// =========== Status Management ===========
+
+func (a *App) setStatus(msg string) {
+	a.statusMsg = msg
+	a.statusTime = time.Now().Add(3 * time.Second)
+}
+
+func (a *App) setError(msg string) {
+	a.errMsg = msg
+	a.errTime = time.Now().Add(5 * time.Second)
+}
+
+func (a *App) hasStatus() bool {
+	return time.Now().Before(a.statusTime) && a.statusMsg != ""
+}
+
+func (a *App) hasError() bool {
+	return time.Now().Before(a.errTime) && a.errMsg != ""
+}
+
 // =========== Rendering ===========
+
+const (
+	colorReset  = "\033[0m"
+	colorRed    = "\033[31m"
+	colorGreen  = "\033[32m"
+	colorYellow = "\033[33m"
+	colorPurple = "\033[35m"
+	colorCyan   = "\033[36m"
+	colorGray   = "\033[90m"
+	colorBold   = "\033[1m"
+)
+
+var (
+	styleTitle   = colorCyan + colorBold
+	styleHeader  = colorPurple
+	styleOnline  = colorGreen
+	styleOffline = colorGray
+	styleSelect  = colorYellow + colorBold
+	styleError   = colorRed
+	styleSuccess = colorGreen
+	styleMuted   = colorGray
+)
 
 func clear() {
 	fmt.Print("\033[2J\033[H")
@@ -523,23 +594,19 @@ func (a *App) Render() {
 	clear()
 	a.renderHeader()
 	fmt.Println()
-
 	if a.incoming != nil {
 		a.renderIncoming()
 		fmt.Println()
 	}
-
 	if a.activeCall != nil && a.state == StateInCall {
 		a.renderActiveCall()
 		fmt.Println()
 	}
-
 	if !a.isRegistered() {
 		a.renderRegister()
 	} else {
-		a.renderNodes()
+		a.renderNodeList()
 	}
-
 	fmt.Println()
 	a.renderFooter()
 }
@@ -558,13 +625,13 @@ func (a *App) renderRegister() {
 	fmt.Println(colorYellow + " ║          Not Registered               ║ " + colorReset)
 	fmt.Println(colorYellow + " ╚═══════════════════════════════════════╝ " + colorReset)
 	fmt.Println()
-	fmt.Println("  Identity file: " + styleMuted + a.config.path + colorReset)
+	fmt.Println("  Identity file: " + styleMuted + a.cfg.configPath + colorReset)
 	fmt.Println()
-	fmt.Printf("  %sNetwork ID:%s  %s\n", styleMuted, colorReset, a.config.NetworkID)
-	fmt.Printf("  %sNode ID:%s     %s\n", styleMuted, colorReset, a.config.NodeID)
-	fmt.Printf("  %sName:%s        %s\n", styleMuted, colorReset, a.config.Name)
+	fmt.Printf("  %sNetwork ID:%s  %s\n", styleMuted, colorReset, a.cfg.NetworkID)
+	fmt.Printf("  %sNode ID:%s     %s\n", styleMuted, colorReset, a.cfg.NodeID)
+	fmt.Printf("  %sName:%s        %s\n", styleMuted, colorReset, a.cfg.Name)
 	fmt.Println()
-	fmt.Println("  Edit the file above or use API to register.")
+	fmt.Println("  Edit the file or create it with:")
 	fmt.Println()
 	fmt.Println("  Example:")
 	example := `  {
@@ -575,19 +642,16 @@ func (a *App) renderRegister() {
 	fmt.Println(styleMuted + example + colorReset)
 }
 
-func (a *App) renderNodes() {
+func (a *App) renderNodeList() {
 	filtered := a.filterNodes()
-	onlineCount := 0
-	offlineCount := 0
+	online := 0
 	for _, n := range filtered {
 		if n.Status == "online" {
-			onlineCount++
-		} else {
-			offlineCount++
+			online++
 		}
 	}
 
-	header := fmt.Sprintf(" Nodes on %s ", a.config.NetworkID)
+	header := fmt.Sprintf(" Nodes on %s ", a.cfg.NetworkID)
 	fmt.Println(" " + styleHeader + header + colorReset)
 	fmt.Println()
 
@@ -596,23 +660,22 @@ func (a *App) renderNodes() {
 		return
 	}
 
-	fmt.Printf("  %s  %-20s  %-20s  %s\n", styleSelected+"▶"+colorReset, "Name", "Node ID", "Status")
-	fmt.Println("  " + strings.Repeat("─", 72))
+	fmt.Printf("  %s  %-20s  %-20s  %s\n", styleSelect+"▶"+colorReset, "Name", "Node ID", "Status")
+	fmt.Println("  " + strings.Repeat("─", 73))
 
 	for i, node := range filtered {
 		sel := "  "
 		if i == a.selectedIdx {
-			sel = styleSelected + "▶" + colorReset
+			sel = styleSelect + "▶" + colorReset
 		}
 
 		name := truncate(node.Name, 20)
 		id := truncate(node.ID, 20)
 
 		var status string
-		switch node.Status {
-		case "online":
+		if node.Status == "online" {
 			status = styleOnline + "● online" + colorReset
-		default:
+		} else {
 			status = styleOffline + "○ offline" + colorReset
 		}
 
@@ -622,8 +685,8 @@ func (a *App) renderNodes() {
 	fmt.Println()
 	summary := fmt.Sprintf("%d total  %s%d online%s  %s%d offline%s",
 		len(filtered),
-		styleSuccess, onlineCount, colorReset,
-		styleMuted, offlineCount, colorReset,
+		styleSuccess, online, colorReset,
+		styleMuted, len(filtered)-online, colorReset,
 	)
 	fmt.Println("  " + summary)
 }
@@ -643,7 +706,7 @@ func (a *App) renderIncoming() {
 	fmt.Println()
 	fmt.Printf("  [a] %sAnswer%s    [%sR%s] %sReject%s\n",
 		styleSuccess, colorReset,
-		styleSelected, colorReset,
+		styleSelect, colorReset,
 		styleError, colorReset,
 	)
 	fmt.Println()
@@ -651,26 +714,15 @@ func (a *App) renderIncoming() {
 
 func (a *App) renderFooter() {
 	now := time.Now().Format("15:04:05")
-	timeStr := styleMuted + " " + now + " " + colorReset
 
-	statusLine := ""
-	if time.Now().Before(a.statusTime) {
-		if a.errMsg != "" {
-			statusLine = " " + styleError + a.errMsg + colorReset + " "
-		} else if a.statusMsg != "" {
-			statusLine = " " + styleSuccess + a.statusMsg + colorReset + " "
-		}
+	if a.hasError() {
+		fmt.Println(" " + styleError + a.errMsg + colorReset + " ")
+	} else if a.hasStatus() {
+		fmt.Println(" " + styleSuccess + a.statusMsg + colorReset + " ")
 	}
 
 	help := styleMuted + " [↑↓]Select  [Enter]Call/End  [a]Ans  [R]Rej  [d]Del  [r]Ref  [q]Quit " + colorReset
-
-	if statusLine != "" {
-		fmt.Println(statusLine)
-		fmt.Println(timeStr)
-	} else {
-		fmt.Println(help)
-		fmt.Println(timeStr)
-	}
+	fmt.Println(" " + help + "  " + styleMuted + now + colorReset)
 }
 
 func (a *App) formatDuration(s int) string {
@@ -686,13 +738,13 @@ func truncate(s string, n int) string {
 	return s[:n-2] + ".."
 }
 
-// =========== Main Loop ===========
+// =========== Input Handling ===========
 
 func (a *App) Run() {
 	oldState, _ := term.MakeRaw(int(os.Stdin.Fd()))
 	defer term.Restore(int(os.Stdin.Fd()), oldState)
 
-	// Signal handling
+	// Signals
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM, syscall.SIGWINCH)
 	go func() {
@@ -700,7 +752,7 @@ func (a *App) Run() {
 		close(a.shouldQuit)
 	}()
 
-	// stdin reader
+	// Stdin reader
 	go func() {
 		reader := bufio.NewReader(os.Stdin)
 		for {
@@ -717,32 +769,24 @@ func (a *App) Run() {
 		}
 	}()
 
-	// Auto-connect if configured
-	if a.config.NodeID != "" && a.config.NetworkID != "" && a.config.Name != "" {
-		a.statusMsg = "Registered as " + a.config.Name
-		a.statusTime = time.Now().Add(2 * time.Second)
+	// Auto-connect
+	if a.isRegistered() {
+		a.setStatus("Registered as " + a.cfg.Name)
 		go a.fetchNodes()
-		go func() {
-			ch, _ := a.client.ConnectWebSocket(a.config.NodeID)
-			for msg := range ch {
-				a.handleWS(msg)
-			}
-		}()
+		go a.connectWS()
 	}
 
-	// Render loop
-	ticker := time.NewTicker(33 * time.Millisecond)
-	defer ticker.Stop()
-
+	// Main loop
 	for {
 		select {
-		case <-ticker.C:
+		case <-a.renderTick:
 			a.Render()
-		case msg := <-a.client.msgChan:
+		case msg := <-a.ws.Messages():
 			a.handleWS(msg)
-		case <-a.client.closeChan:
+		case <-a.ws.Closed():
+			// WS closed — could reconnect
 		case b := <-a.stdinChan:
-			a.handleKey(b)
+			a.handleInput(b)
 		case <-a.shouldQuit:
 			clear()
 			os.Exit(0)
@@ -750,7 +794,7 @@ func (a *App) Run() {
 	}
 }
 
-func (a *App) handleKey(b byte) {
+func (a *App) handleInput(b byte) {
 	switch b {
 	case 'q':
 		close(a.shouldQuit)
@@ -759,9 +803,10 @@ func (a *App) handleKey(b byte) {
 	case 'r':
 		a.fetchNodes()
 	case 13: // Enter
-		if a.state == StateBrowse {
+		switch a.state {
+		case StateBrowse:
 			a.callSelected()
-		} else if a.state == StateInCall {
+		case StateInCall:
 			a.endCall()
 		}
 	case 'a':
@@ -778,68 +823,29 @@ func (a *App) handleKey(b byte) {
 		}
 	case 0x1B: // ESC
 		go func() {
-			b2 := readByte()
+			b2 := a.readByte()
 			if b2 != '[' {
 				return
 			}
-			b3 := readByte()
+			b3 := a.readByte()
 			filtered := a.filterNodes()
+			if len(filtered) == 0 {
+				return
+			}
 			switch b3 {
-			case 'A': // up
-				if len(filtered) > 0 {
-					a.selectedIdx = (a.selectedIdx - 1 + len(filtered)) % len(filtered)
-				}
-			case 'B': // down
-				if len(filtered) > 0 {
-					a.selectedIdx = (a.selectedIdx + 1) % len(filtered)
-				}
+			case 'A':
+				a.selectedIdx = (a.selectedIdx - 1 + len(filtered)) % len(filtered)
+			case 'B':
+				a.selectedIdx = (a.selectedIdx + 1) % len(filtered)
 			}
 		}()
 	}
 }
 
-func readByte() byte {
+func (a *App) readByte() byte {
 	var b [1]byte
 	os.Stdin.Read(b[:])
 	return b[0]
-}
-
-func (a *App) handleWS(msg Message) {
-	switch msg.Type {
-	case "CALL_REQUEST":
-		a.setIncoming(msg.FromID, msg.CallID)
-	case "CALL_ACCEPT":
-		if a.state == StateCalling && a.activeCall != nil {
-			a.state = StateInCall
-			a.callSecs = 0
-			a.callTimer = time.NewTicker(1 * time.Second)
-			go func() {
-				for range a.callTimer.C {
-					if a.state != StateInCall {
-						return
-					}
-					a.callSecs++
-				}
-			}()
-		}
-	case "CALL_REJECT":
-		if a.state == StateCalling {
-			a.errMsg = "Call rejected"
-			a.state = StateBrowse
-			a.activeCall = nil
-			a.statusTime = time.Now().Add(3 * time.Second)
-		}
-	case "CALL_END":
-		if a.state == StateInCall || a.state == StateCalling {
-			a.state = StateBrowse
-			a.activeCall = nil
-			if a.callTimer != nil {
-				a.callTimer.Stop()
-			}
-			a.statusMsg = "Call ended"
-			a.statusTime = time.Now().Add(2 * time.Second)
-		}
-	}
 }
 
 // =========== Entry ===========
@@ -848,7 +854,6 @@ func main() {
 	cfg := NewConfig()
 	_ = cfg.Load()
 
-	client := NewClient(cfg.ServerAddr)
-	app := NewApp(client, cfg)
+	app := NewApp(cfg)
 	app.Run()
 }
