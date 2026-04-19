@@ -17,20 +17,6 @@ import (
 	"github.com/gorilla/websocket"
 )
 
-// =========== Colors/Styles ===========
-
-var (
-	styleTitle   = tcell.StyleDefault.Foreground(tcell.NewRGBColor(0, 255, 255)).Bold(true) // Cyan
-	styleHeader  = tcell.StyleDefault.Foreground(tcell.NewRGBColor(128, 0, 128))            // Purple
-	styleOnline  = tcell.StyleDefault.Foreground(tcell.ColorGreen)
-	styleOffline = tcell.StyleDefault.Foreground(tcell.ColorGray)
-	styleSelect  = tcell.StyleDefault.Foreground(tcell.NewRGBColor(255, 255, 0)).Bold(true) // Yellow
-	styleError   = tcell.StyleDefault.Foreground(tcell.ColorRed)
-	styleSuccess = tcell.StyleDefault.Foreground(tcell.ColorGreen)
-	styleMuted   = tcell.StyleDefault.Foreground(tcell.ColorGray)
-	styleNormal  = tcell.StyleDefault
-)
-
 // =========== Domain Types ===========
 
 type Node struct {
@@ -75,6 +61,7 @@ type Config struct {
 	Name       string `json:"name"`
 	ServerAddr string `json:"server_addr"`
 	configPath string
+	refreshInt int `json:"refresh_interval"` // seconds
 }
 
 func NewConfig() *Config {
@@ -82,6 +69,7 @@ func NewConfig() *Config {
 	return &Config{
 		ServerAddr: "http://localhost:8080",
 		configPath: filepath.Join(home, ".zerophone-cli.json"),
+		refreshInt: 5,
 	}
 }
 
@@ -92,7 +80,23 @@ func (c *Config) Load() error {
 	if err != nil {
 		return err
 	}
-	return json.Unmarshal(data, c)
+	if err := json.Unmarshal(data, c); err != nil {
+		// Try loading without refreshInt for backwards compat
+		var partial struct {
+			NetworkID  string `json:"network_id"`
+			NodeID     string `json:"node_id"`
+			Name       string `json:"name"`
+			ServerAddr string `json:"server_addr"`
+		}
+		if err2 := json.Unmarshal(data, &partial); err2 != nil {
+			return err
+		}
+		c.NetworkID = partial.NetworkID
+		c.NodeID = partial.NodeID
+		c.Name = partial.Name
+		c.ServerAddr = partial.ServerAddr
+	}
+	return nil
 }
 
 func (c *Config) Save() error {
@@ -310,6 +314,7 @@ type App struct {
 
 	nodes       []Node
 	selectedIdx int
+	scrollIdx   int // for scrolling long lists
 
 	activeCall *CallInfo
 	incoming   *CallInfo
@@ -321,8 +326,9 @@ type App struct {
 	errMsg     string
 	errTime    time.Time
 
-	screen tcell.Screen
-	quit   chan struct{}
+	screen      tcell.Screen
+	quit        chan struct{}
+	lastRefresh time.Time
 }
 
 func NewApp(cfg *Config) *App {
@@ -339,15 +345,16 @@ func NewApp(cfg *Config) *App {
 	ws := NewWSClient()
 
 	return &App{
-		cfg:        cfg,
-		http:       client,
-		ws:         ws,
-		state:      StateBrowse,
-		nodes:      []Node{},
-		statusTime: time.Now(),
-		errTime:    time.Now(),
-		screen:     screen,
-		quit:       make(chan struct{}),
+		cfg:         cfg,
+		http:        client,
+		ws:          ws,
+		state:       StateBrowse,
+		nodes:       []Node{},
+		statusTime:  time.Now(),
+		errTime:     time.Now(),
+		screen:      screen,
+		quit:        make(chan struct{}),
+		lastRefresh: time.Now(),
 	}
 }
 
@@ -382,6 +389,7 @@ func (a *App) Register(nodeID, name, networkID string) {
 	if err != nil {
 		a.setError("Registration failed: " + err.Error())
 	} else {
+		a.cfg.NodeID = registered.ID
 		a.setStatus("Registered as " + registered.Name)
 		go a.fetchNodes()
 		go a.connectWS()
@@ -397,6 +405,8 @@ func (a *App) fetchNodes() {
 		a.setError("Fetch error: " + err.Error())
 	} else {
 		a.nodes = nodes
+		a.selectedIdx = 0
+		a.scrollIdx = 0
 		online := 0
 		for _, n := range nodes {
 			if n.Status == "online" && n.ID != a.cfg.NodeID {
@@ -409,6 +419,7 @@ func (a *App) fetchNodes() {
 			a.setStatus(fmt.Sprintf("%d node(s) online", online))
 		}
 	}
+	a.lastRefresh = time.Now()
 }
 
 func (a *App) DeleteSelectedNode() {
@@ -598,10 +609,9 @@ func (a *App) render() {
 	screen := a.screen
 	screen.Clear()
 
-	_, width := screen.Size()
-	height, _ := screen.Size()
+	width, height := screen.Size()
 
-	// Styles (define once at package level, recreate per render since tcell.Style is immutable)
+	// Colors
 	titleStyle := tcell.StyleDefault.Foreground(tcell.NewRGBColor(0, 255, 255)).Bold(true) // Cyan
 	headerStyle := tcell.StyleDefault.Foreground(tcell.NewRGBColor(128, 0, 128))           // Purple
 	onlineStyle := tcell.StyleDefault.Foreground(tcell.ColorGreen)
@@ -612,7 +622,31 @@ func (a *App) render() {
 	mutedStyle := tcell.StyleDefault.Foreground(tcell.ColorGray)
 	normalStyle := tcell.StyleDefault
 
-	// Header
+	// Header bar
+	a.renderHeader(screen, width, titleStyle, headerStyle, mutedStyle)
+
+	// Incoming call overlay
+	if a.incoming != nil {
+		a.renderIncoming(screen, width, height, errorStyle, selectStyle, successStyle, mutedStyle)
+	}
+
+	// Active call bar
+	if a.activeCall != nil && a.state == StateInCall {
+		a.renderActiveCall(screen, width, height, successStyle, normalStyle)
+	}
+
+	// Main content
+	if !a.isRegistered() {
+		a.renderRegister(screen, width, titleStyle, headerStyle, mutedStyle, normalStyle, errorStyle)
+	} else {
+		a.renderNodeList(screen, width, height, normalStyle, selectStyle, onlineStyle, offlineStyle, headerStyle, mutedStyle)
+	}
+
+	// Footer
+	a.renderFooter(screen, width, height, errorStyle, successStyle, mutedStyle)
+}
+
+func (a *App) renderHeader(screen tcell.Screen, width int, titleStyle, headerStyle, mutedStyle tcell.Style) {
 	title := " ZeroPhone CLI "
 	status := "[Disconnected]"
 	if a.isRegistered() {
@@ -623,75 +657,15 @@ func (a *App) render() {
 	separator := strings.Repeat("─", width-2)
 	a.drawText(screen, 2, 1, separator, headerStyle)
 
-	// Incoming call overlay
-	if a.incoming != nil {
-		y := height/2 - 2
-		text := " Incoming Call from " + a.incoming.From + " "
-		x := (width - len(text)) / 2
-		if x < 2 {
-			x = 2
-		}
-		a.drawText(screen, x, y, text, errorStyle)
-		y += 2
-		opt1 := "[a] Answer"
-		opt2 := "[R] Reject"
-		line := "  " + opt1 + "    " + opt2
-		x = (width - len(line)) / 2
-		if x < 2 {
-			x = 2
-		}
-		a.drawText(screen, x, y, line, mutedStyle)
+	// Show network ID on header line 2
+	if a.isRegistered() {
+		netInfo := " Network: " + a.cfg.NetworkID + " "
+		a.drawText(screen, width-len(netInfo)-2, 0, netInfo, mutedStyle)
 	}
-
-	// Active call bar
-	if a.activeCall != nil && a.state == StateInCall {
-		y := height - 5
-		text := fmt.Sprintf(" Active Call with %s  %s ", a.activeCall.To, a.formatDuration(a.callSecs))
-		x := (width - len(text)) / 2
-		if x < 2 {
-			x = 2
-		}
-		a.drawText(screen, x, y, text, successStyle)
-		y++
-		a.drawText(screen, 2, y, "  Press [Enter] to end the call", normalStyle)
-	}
-
-	// Main content
-	y := 3
-	if !a.isRegistered() {
-		y = a.renderRegister(screen, width, y, titleStyle, headerStyle, mutedStyle, normalStyle, errorStyle)
-	} else {
-		y = a.renderNodeList(screen, width, y, headerStyle, selectStyle, onlineStyle, offlineStyle, normalStyle)
-	}
-
-	// Footer
-	separator2 := strings.Repeat("─", width-2)
-	a.drawText(screen, 2, height-3, separator2, mutedStyle)
-
-	// Status line
-	if a.hasError() {
-		a.drawText(screen, 2, height-2, " "+a.errMsg+" ", errorStyle)
-	} else if a.hasStatus() {
-		a.drawText(screen, 2, height-2, " "+a.statusMsg+" ", successStyle)
-	}
-
-	// Help + time
-	now := time.Now().Format("15:04:05")
-	help := " [↑↓]Select  [Enter]Call/End  [a]Ans  [R]Rej  [d]Del  [r]Ref  [q]Quit "
-	timeStr := " " + now + " "
-	helpX := 2
-	timeX := width - 2 - len(timeStr)
-	if timeX < helpX+len(help) {
-		timeX = helpX + len(help)
-	}
-	a.drawText(screen, helpX, height-1, help, mutedStyle)
-	a.drawText(screen, timeX, height-1, timeStr, mutedStyle)
-
-	screen.Show()
 }
 
-func (a *App) renderRegister(screen tcell.Screen, width, startY int, titleStyle, headerStyle, mutedStyle, normalStyle, errorStyle tcell.Style) int {
-	y := startY
+func (a *App) renderRegister(screen tcell.Screen, width int, titleStyle, headerStyle, mutedStyle, normalStyle, errorStyle tcell.Style) {
+	y := 3
 
 	boxText := " Not Registered "
 	boxWidth := len(boxText) + 4
@@ -700,19 +674,21 @@ func (a *App) renderRegister(screen tcell.Screen, width, startY int, titleStyle,
 		boxX = 2
 	}
 
-	// Top line
-	line := "╔" + strings.Repeat("═", boxWidth-2) + "╗"
-	a.drawText(screen, boxX, y, line, headerStyle)
-	y++
+	// Draw box
+	top := "╔" + strings.Repeat("═", boxWidth-2) + "╗"
+	mid := "║" + strings.Repeat(" ", boxWidth-2) + "║"
+	bot := "╚" + strings.Repeat("═", boxWidth-2) + "╝"
 
-	// Text line
-	inner := "║ " + boxText + " ║"
-	a.drawText(screen, boxX, y, inner, errorStyle)
+	a.drawText(screen, boxX, y, top, headerStyle)
 	y++
-
-	// Bottom line
-	line = "╚" + strings.Repeat("═", boxWidth-2) + "╝"
-	a.drawText(screen, boxX, y, line, headerStyle)
+	textX := boxX + 2
+	a.drawText(screen, textX, y, boxText, errorStyle)
+	y++
+	a.drawText(screen, boxX, y, mid, headerStyle)
+	textX = boxX + 2
+	a.drawText(screen, textX, y, "║ "+boxText+" ║", errorStyle)
+	y++
+	a.drawText(screen, boxX, y, bot, headerStyle)
 	y += 2
 
 	// Config info
@@ -739,11 +715,13 @@ func (a *App) renderRegister(screen tcell.Screen, width, startY int, titleStyle,
 		y++
 	}
 
-	return y
+	// Help
+	y += 1
+	a.drawText(screen, 2, y, "Press [r] to refresh nodes after registration", normalStyle)
 }
 
-func (a *App) renderNodeList(screen tcell.Screen, width, startY int, headerStyle, selectStyle, onlineStyle, offlineStyle, normalStyle tcell.Style) int {
-	y := startY
+func (a *App) renderNodeList(screen tcell.Screen, width, height int, normalStyle, selectStyle, onlineStyle, offlineStyle, headerStyle, mutedStyle tcell.Style) int {
+	y := 3
 	filtered := a.filterNodes()
 	online := 0
 	for _, n := range filtered {
@@ -752,54 +730,182 @@ func (a *App) renderNodeList(screen tcell.Screen, width, startY int, headerStyle
 		}
 	}
 
-	// Header
+	// Header with full info
 	header := " Nodes on " + a.cfg.NetworkID + " "
 	a.drawText(screen, 2, y, header, headerStyle)
+	y++
+
+	// Stats line
+	stats := fmt.Sprintf(" Total: %d  |  Online: %d  |  Offline: %d ", len(filtered), online, len(filtered)-online)
+	if a.lastRefresh.After(time.Now().Add(-30 * time.Second)) {
+		refreshInfo := fmt.Sprintf(" (ref: %s)", a.lastRefresh.Format("15:04:05"))
+		stats += refreshInfo
+	}
+	a.drawText(screen, 2, y, stats, mutedStyle)
 	y += 2
 
 	if len(filtered) == 0 {
-		a.drawText(screen, 2, y, "  No other nodes discovered", normalStyle)
+		msg := "  No other nodes discovered"
+		if a.isRegistered() {
+			msg += " (press [r] to refresh)"
+		}
+		a.drawText(screen, 2, y, msg, normalStyle)
 		return y + 1
 	}
 
-	// Table header
-	a.drawText(screen, 2, y, "▶  Name                  Node ID                Status", selectStyle)
+	// Table headers
+	headerRow := fmt.Sprintf(" %s  %-25s  %-20s  %-10s  %s", "▶", "Name", "Node ID", "Status", "Last Seen")
+	a.drawText(screen, 2, y, headerRow, selectStyle)
 	y++
-	separator := strings.Repeat("─", width-4)
+	separator := strings.Repeat("─", max(width-2, 80))
 	a.drawText(screen, 2, y, separator, headerStyle)
 	y++
 
-	// Nodes
-	for i, node := range filtered {
+	// Visible nodes with scrolling
+	visibleCount := height - y - 5 // leave room for footer
+	if visibleCount <= 0 {
+		visibleCount = 5
+	}
+	if a.selectedIdx < a.scrollIdx {
+		a.scrollIdx = a.selectedIdx
+	}
+	if a.selectedIdx >= a.scrollIdx+visibleCount {
+		a.scrollIdx = a.selectedIdx - visibleCount + 1
+	}
+
+	endIdx := a.scrollIdx + visibleCount
+	if endIdx > len(filtered) {
+		endIdx = len(filtered)
+	}
+
+	for i := a.scrollIdx; i < endIdx; i++ {
+		node := filtered[i]
+
 		sel := "  "
 		if i == a.selectedIdx {
 			sel = "▶"
 		}
 
-		name := truncate(node.Name, 20)
+		name := truncate(node.Name, 25)
 		id := truncate(node.ID, 20)
+		lastSeen := time.Unix(node.LastSeen, 0).Format("15:04")
 
 		var status string
 		if node.Status == "online" {
-			status = "● online"
+			status = "● ONLINE"
 		} else {
 			status = "○ offline"
 		}
 
-		line := fmt.Sprintf("%s  %-20s  %-20s  %s", sel, name, id, status)
+		line := fmt.Sprintf(" %s  %-25s  %-20s  %-10s  %s", sel, name, id, status, lastSeen)
 		style := normalStyle
 		if i == a.selectedIdx {
 			style = selectStyle
 		}
 		a.drawText(screen, 2, y, line, style)
 		y++
+
+		// Show capabilities if selected
+		if i == a.selectedIdx && len(node.Capabilities) > 0 {
+			y++
+			capLine := "    Capabilities: " + strings.Join(node.Capabilities, ", ")
+			a.drawText(screen, 2, y, capLine, mutedStyle)
+			y++
+		}
 	}
 
-	y++
-	summary := fmt.Sprintf("  %d total  %d online  %d offline", len(filtered), online, len(filtered)-online)
-	a.drawText(screen, 2, y, summary, normalStyle)
+	// Scrollbar if needed
+	if len(filtered) > visibleCount {
+		scrollBarY := y - visibleCount
+		barHeight := (visibleCount * visibleCount) / len(filtered)
+		if barHeight < 1 {
+			barHeight = 1
+		}
+		barPos := (a.scrollIdx * visibleCount) / len(filtered)
+		for i := 0; i < visibleCount; i++ {
+			if i >= barPos && i < barPos+barHeight {
+				a.drawText(screen, width-2, scrollBarY+i, "█", mutedStyle)
+			} else {
+				a.drawText(screen, width-2, scrollBarY+i, "│", mutedStyle)
+			}
+		}
+	}
 
-	return y + 2
+	return y
+}
+
+func (a *App) renderActiveCall(screen tcell.Screen, width, height int, successStyle, normalStyle tcell.Style) {
+	y := height - 5
+	text := fmt.Sprintf(" ╔══ Active Call with %s ─── %s ══╗ ", a.activeCall.To, a.formatDuration(a.callSecs))
+	x := (width - len(text)) / 2
+	if x < 2 {
+		x = 2
+	}
+	// Draw box edges manually
+	a.drawText(screen, x, y, "╔══ Active Call ══╗", successStyle)
+	y++
+	callInfo := fmt.Sprintf("   With: %s  |  Duration: %s  ", a.activeCall.To, a.formatDuration(a.callSecs))
+	a.drawText(screen, x, y, callInfo, successStyle)
+	y++
+	a.drawText(screen, x, y, "╚══════════════════╝", successStyle)
+	y++
+	a.drawText(screen, 2, y, "  Press [Enter] to end the call", normalStyle)
+}
+
+func (a *App) renderIncoming(screen tcell.Screen, width, height int, errorStyle, selectStyle, successStyle, mutedStyle tcell.Style) {
+	y := height/2 - 2
+	text := " ╔══ Incoming Call ══ from " + a.incoming.From + " "
+	x := (width - len(text)) / 2
+	if x < 2 {
+		x = 2
+	}
+	a.drawText(screen, x, y, text, errorStyle)
+	y += 2
+	opt1 := "[a] Answer"
+	opt2 := "[R] Reject"
+	line := "  " + opt1 + "    " + opt2
+	x = (width - len(line)) / 2
+	if x < 2 {
+		x = 2
+	}
+	a.drawText(screen, x, y, line, mutedStyle)
+}
+
+func (a *App) renderFooter(screen tcell.Screen, width, height int, errorStyle, successStyle, mutedStyle tcell.Style) {
+	y := height - 3
+	separator := strings.Repeat("─", width-2)
+	a.drawText(screen, 2, y, separator, mutedStyle)
+
+	// Status line
+	y++
+	if a.hasError() {
+		a.drawText(screen, 2, y, " "+a.errMsg+" ", errorStyle)
+	} else if a.hasStatus() {
+		a.drawText(screen, 2, y, " "+a.statusMsg+" ", successStyle)
+	}
+
+	// Help + time
+	y++
+	now := time.Now().Format("15:04:05")
+	help := " [↑↓]Move  [Enter]Call  [a]Ans  [R]Rej  [d]Del  [r]Ref  [q]Quit "
+	timeStr := " " + now + " "
+
+	space := width - 2 - len(help) - len(timeStr)
+	if space < 0 {
+		help = help[:max(0, width-2-len(timeStr))]
+		a.drawText(screen, 2, y, help, mutedStyle)
+		a.drawText(screen, 2+len(help), y, timeStr, mutedStyle)
+	} else {
+		a.drawText(screen, 2, y, help, mutedStyle)
+		a.drawText(screen, width-1-len(timeStr), y, timeStr, mutedStyle)
+	}
+}
+
+func max(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
 }
 
 func (a *App) formatDuration(s int) string {
@@ -835,6 +941,10 @@ func (a *App) Run() {
 		go a.connectWS()
 	}
 
+	// Auto-refresh ticker
+	refreshTicker := time.NewTicker(time.Duration(a.cfg.refreshInt) * time.Second)
+	defer refreshTicker.Stop()
+
 	// Event loop
 	for {
 		select {
@@ -842,6 +952,10 @@ func (a *App) Run() {
 			return
 		case msg := <-a.ws.Messages():
 			a.handleWS(msg)
+		case <-refreshTicker.C:
+			if a.isRegistered() {
+				go a.fetchNodes()
+			}
 		default:
 			// Poll tcell events
 			event := a.screen.PollEvent()
@@ -855,7 +969,6 @@ func (a *App) Run() {
 				a.handleKey(ev)
 			}
 			a.render()
-			// Small sleep to prevent CPU hog
 			time.Sleep(33 * time.Millisecond)
 		}
 	}
@@ -886,6 +999,7 @@ func (a *App) handleKey(ev *tcell.EventKey) {
 			close(a.quit)
 		case 'r':
 			a.fetchNodes()
+			a.setStatus("Refreshing...")
 		case 'a':
 			if a.state == StateIncoming && a.incoming != nil {
 				a.answerCall(a.incoming.From, a.incoming.CallID)
@@ -898,8 +1012,59 @@ func (a *App) handleKey(ev *tcell.EventKey) {
 			if a.state == StateBrowse {
 				a.DeleteSelectedNode()
 			}
+		case '?':
+			a.showHelpOverlay()
 		}
 	}
+}
+
+func (a *App) showHelpOverlay() {
+	// Simple help dialog — render on top
+	screen := a.screen
+
+	help := []string{
+		"╔══ ZeroPhone CLI Help ════════════════════════════════╗",
+		"║                                                    ║",
+		"║  Navigation:                                       ║",
+		"║    ↑/↓      Move selection                         ║",
+		"║    Enter    Call selected node / End call          ║",
+		"║    r        Refresh node list                      ║",
+		"║                                                    ║",
+		"║  Calls:                                            ║",
+		"║    a        Answer incoming call                   ║",
+		"║    R        Reject incoming call                   ║",
+		"║                                                    ║",
+		"║  Node Management:                                  ║",
+		"║    d        Delete offline node (when selected)   ║",
+		"║                                                    ║",
+		"║  Other:                                            ║",
+		"║    ?        Show this help                         ║",
+		"║    q        Quit                                   ║",
+		"║                                                    ║",
+		"╚════════════════════════════════════════════════════╝",
+	}
+
+	boxW := 60
+	boxH := len(help)
+	scrWidth, scrHeight := screen.Size()
+	startX := (scrWidth - boxW) / 2
+	startY := (scrHeight - boxH) / 2
+
+	// Draw dim overlay
+	for y := 0; y < scrHeight; y++ {
+		for x := 0; x < scrWidth; x++ {
+			screen.SetContent(x, y, ' ', nil, tcell.StyleDefault)
+		}
+	}
+
+	// Draw box
+	for i, line := range help {
+		a.drawText(screen, startX, startY+i, line, tcell.StyleDefault.Foreground(tcell.ColorYellow))
+	}
+
+	screen.Show()
+	// Wait for key press
+	a.screen.PollEvent()
 }
 
 // =========== Entry ===========
