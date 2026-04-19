@@ -295,6 +295,7 @@ type App struct {
 	callTimer   *time.Ticker
 	callSecs    int
 	shouldQuit  chan struct{}
+	stdinChan   chan byte
 }
 
 type CallInfo struct {
@@ -342,6 +343,7 @@ func NewApp(client *Client, cfg *Config) *App {
 		nodes:      []Node{},
 		statusTime: time.Now(),
 		shouldQuit: make(chan struct{}),
+		stdinChan:  make(chan byte, 100),
 	}
 }
 
@@ -519,31 +521,25 @@ func clear() {
 
 func (a *App) Render() {
 	clear()
-
-	// Header
 	a.renderHeader()
 	fmt.Println()
 
-	// Incoming call overlay
 	if a.incoming != nil {
 		a.renderIncoming()
 		fmt.Println()
 	}
 
-	// Active call bar
 	if a.activeCall != nil && a.state == StateInCall {
 		a.renderActiveCall()
 		fmt.Println()
 	}
 
-	// Main content
 	if !a.isRegistered() {
 		a.renderRegister()
 	} else {
 		a.renderNodes()
 	}
 
-	// Footer
 	fmt.Println()
 	a.renderFooter()
 }
@@ -554,13 +550,13 @@ func (a *App) renderHeader() {
 	if a.isRegistered() {
 		status = styleSuccess + "[Online]" + colorReset
 	}
-
-	line := fmt.Sprintf("%s %s", title, status)
-	fmt.Println(a.box(line, styleHeader))
+	fmt.Println(" " + title + " " + status)
 }
 
 func (a *App) renderRegister() {
-	fmt.Println(a.box(colorYellow+" Not Registered "+colorReset, colorYellow))
+	fmt.Println(colorYellow + " ╔═══════════════════════════════════════╗ " + colorReset)
+	fmt.Println(colorYellow + " ║          Not Registered               ║ " + colorReset)
+	fmt.Println(colorYellow + " ╚═══════════════════════════════════════╝ " + colorReset)
 	fmt.Println()
 	fmt.Println("  Identity file: " + styleMuted + a.config.path + colorReset)
 	fmt.Println()
@@ -591,21 +587,18 @@ func (a *App) renderNodes() {
 		}
 	}
 
-	// Node list header
 	header := fmt.Sprintf(" Nodes on %s ", a.config.NetworkID)
-	fmt.Println(a.box(styleHeader+header+colorReset, styleHeader))
+	fmt.Println(" " + styleHeader + header + colorReset)
 	fmt.Println()
 
 	if len(filtered) == 0 {
-		fmt.Println(a.center("No other nodes discovered"))
+		fmt.Println("  " + styleMuted + "No other nodes discovered" + colorReset)
 		return
 	}
 
-	// Table header
 	fmt.Printf("  %s  %-20s  %-20s  %s\n", styleSelected+"▶"+colorReset, "Name", "Node ID", "Status")
-	fmt.Println(strings.Repeat("─", 75))
+	fmt.Println("  " + strings.Repeat("─", 72))
 
-	// Nodes
 	for i, node := range filtered {
 		sel := "  "
 		if i == a.selectedIdx {
@@ -626,73 +619,58 @@ func (a *App) renderNodes() {
 		fmt.Printf("%s  %-20s  %-20s  %s\n", sel, name, id, status)
 	}
 
-	// Summary
 	fmt.Println()
 	summary := fmt.Sprintf("%d total  %s%d online%s  %s%d offline%s",
 		len(filtered),
 		styleSuccess, onlineCount, colorReset,
 		styleMuted, offlineCount, colorReset,
 	)
-	fmt.Println(a.center(summary))
+	fmt.Println("  " + summary)
 }
 
 func (a *App) renderActiveCall() {
-	line := fmt.Sprintf(" Active Call with %s  %s ", a.activeCall.To, a.formatDuration(a.callSecs))
-	fmt.Println(a.box(line, styleSuccess))
+	fmt.Print(" " + styleSuccess)
+	fmt.Printf(" ╔═ Active Call with %s  %s ╗ ", a.activeCall.To, a.formatDuration(a.callSecs))
+	fmt.Println(colorReset)
 	fmt.Println()
 	fmt.Println("  Press [Enter] to end the call")
 }
 
 func (a *App) renderIncoming() {
-	fmt.Println(a.box(colorYellow+" Incoming Call "+colorReset+" from "+a.incoming.From, colorYellow))
+	fmt.Print(" " + colorYellow)
+	fmt.Printf(" ╔═ Incoming Call from %s ╗ ", a.incoming.From)
+	fmt.Println(colorReset)
 	fmt.Println()
-	fmt.Printf("  [a] %sAnswer%s    [%sR%s] %sReject%s    [%sd%s] %sDelete Node%s\n",
+	fmt.Printf("  [a] %sAnswer%s    [%sR%s] %sReject%s\n",
 		styleSuccess, colorReset,
 		styleSelected, colorReset,
 		styleError, colorReset,
-		styleError, colorReset,
-		styleMuted, colorReset)
+	)
+	fmt.Println()
 }
 
 func (a *App) renderFooter() {
 	now := time.Now().Format("15:04:05")
-	timeStr := styleMuted + now + colorReset
+	timeStr := styleMuted + " " + now + " " + colorReset
 
-	// Status line
 	statusLine := ""
 	if time.Now().Before(a.statusTime) {
 		if a.errMsg != "" {
-			statusLine = styleError + a.errMsg + colorReset
+			statusLine = " " + styleError + a.errMsg + colorReset + " "
 		} else if a.statusMsg != "" {
-			statusLine = styleSuccess + a.statusMsg + colorReset
+			statusLine = " " + styleSuccess + a.statusMsg + colorReset + " "
 		}
 	}
 
-	// Help
-	help := styleMuted + "[↑↓]Select  [Enter]Call/End  [a]Ans  [R]Rej  [d]Del  [r]Ref  [q]Quit" + colorReset
+	help := styleMuted + " [↑↓]Select  [Enter]Call/End  [a]Ans  [R]Rej  [d]Del  [r]Ref  [q]Quit " + colorReset
 
 	if statusLine != "" {
-		fmt.Println(a.box(" "+statusLine+" ", styleMuted))
-		fmt.Print(a.box(" "+timeStr+" ", styleMuted))
+		fmt.Println(statusLine)
+		fmt.Println(timeStr)
 	} else {
-		fmt.Print(a.box(" "+timeStr+"  "+help, styleMuted))
+		fmt.Println(help)
+		fmt.Println(timeStr)
 	}
-}
-
-func (a *App) box(text string, style string) string {
-	if style == "" {
-		return " " + text + " "
-	}
-	return style + " " + text + " " + colorReset
-}
-
-func (a *App) center(s string) string {
-	width := 70
-	if len(s) < width {
-		pad := (width - len(s)) / 2
-		return strings.Repeat(" ", pad) + s
-	}
-	return s
 }
 
 func (a *App) formatDuration(s int) string {
@@ -716,26 +694,23 @@ func (a *App) Run() {
 
 	// Signal handling
 	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM, syscall.SIGWINCH)
 	go func() {
 		<-sigChan
 		close(a.shouldQuit)
 	}()
-	// Also handle resize
-	signal.Notify(sigChan, syscall.SIGWINCH)
 
-	// Non-blocking stdin reader using a goroutine
-	stdinChan := make(chan byte, 100)
+	// stdin reader
 	go func() {
 		reader := bufio.NewReader(os.Stdin)
 		for {
 			b, err := reader.ReadByte()
 			if err != nil {
-				close(stdinChan)
+				close(a.stdinChan)
 				return
 			}
 			select {
-			case stdinChan <- b:
+			case a.stdinChan <- b:
 			case <-a.shouldQuit:
 				return
 			}
@@ -755,7 +730,7 @@ func (a *App) Run() {
 		}()
 	}
 
-	// Render loop (30 FPS)
+	// Render loop
 	ticker := time.NewTicker(33 * time.Millisecond)
 	defer ticker.Stop()
 
@@ -766,8 +741,7 @@ func (a *App) Run() {
 		case msg := <-a.client.msgChan:
 			a.handleWS(msg)
 		case <-a.client.closeChan:
-			// WebSocket closed
-		case b := <-stdinChan:
+		case b := <-a.stdinChan:
 			a.handleKey(b)
 		case <-a.shouldQuit:
 			clear()
@@ -802,8 +776,7 @@ func (a *App) handleKey(b byte) {
 		if a.state == StateBrowse {
 			a.DeleteSelectedNode()
 		}
-	case '[':
-		// Could be start of escape sequence, handle in separate goroutine to avoid blocking
+	case 0x1B: // ESC
 		go func() {
 			b2 := readByte()
 			if b2 != '[' {
@@ -872,14 +845,10 @@ func (a *App) handleWS(msg Message) {
 // =========== Entry ===========
 
 func main() {
-	// Load config
 	cfg := NewConfig()
 	_ = cfg.Load()
 
-	// Create client
 	client := NewClient(cfg.ServerAddr)
-
-	// Start app
 	app := NewApp(client, cfg)
 	app.Run()
 }
