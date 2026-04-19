@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"bytes"
 	"encoding/json"
 	"fmt"
@@ -14,8 +13,22 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/gdamore/tcell/v2"
 	"github.com/gorilla/websocket"
-	"golang.org/x/term"
+)
+
+// =========== Colors/Styles ===========
+
+var (
+	styleTitle   = tcell.StyleDefault.Foreground(tcell.NewRGBColor(0, 255, 255)).Bold(true) // Cyan
+	styleHeader  = tcell.StyleDefault.Foreground(tcell.NewRGBColor(128, 0, 128))            // Purple
+	styleOnline  = tcell.StyleDefault.Foreground(tcell.ColorGreen)
+	styleOffline = tcell.StyleDefault.Foreground(tcell.ColorGray)
+	styleSelect  = tcell.StyleDefault.Foreground(tcell.NewRGBColor(255, 255, 0)).Bold(true) // Yellow
+	styleError   = tcell.StyleDefault.Foreground(tcell.ColorRed)
+	styleSuccess = tcell.StyleDefault.Foreground(tcell.ColorGreen)
+	styleMuted   = tcell.StyleDefault.Foreground(tcell.ColorGray)
+	styleNormal  = tcell.StyleDefault
 )
 
 // =========== Domain Types ===========
@@ -95,7 +108,6 @@ func (c *Config) Save() error {
 type HTTPClient struct {
 	baseURL    string
 	httpClient *http.Client
-	nodeID     string
 }
 
 func NewHTTPClient(baseURL string) *HTTPClient {
@@ -230,7 +242,7 @@ type WSClient struct {
 	closeChan chan struct{}
 }
 
-func NewWSClient(baseURL string) *WSClient {
+func NewWSClient() *WSClient {
 	return &WSClient{
 		msgChan:   make(chan Message, 100),
 		closeChan: make(chan struct{}),
@@ -251,12 +263,10 @@ func (c *WSClient) Connect(baseURL, nodeID string) error {
 }
 
 func (c *WSClient) readPump() {
+	defer close(c.closeChan)
 	for {
 		var msg Message
 		if err := c.conn.ReadJSON(&msg); err != nil {
-			if io.EOF == err {
-				close(c.closeChan)
-			}
 			return
 		}
 		select {
@@ -268,7 +278,6 @@ func (c *WSClient) readPump() {
 }
 
 func (c *WSClient) Messages() <-chan Message { return c.msgChan }
-func (c *WSClient) Closed() <-chan struct{}  { return c.closeChan }
 func (c *WSClient) Close() error {
 	if c.conn != nil {
 		return c.conn.Close()
@@ -276,7 +285,7 @@ func (c *WSClient) Close() error {
 	return nil
 }
 
-// =========== Application State ===========
+// =========== Application ===========
 
 type AppState int
 
@@ -285,7 +294,6 @@ const (
 	StateCalling
 	StateInCall
 	StateIncoming
-	StateError
 )
 
 type CallInfo struct {
@@ -313,14 +321,22 @@ type App struct {
 	errMsg     string
 	errTime    time.Time
 
-	shouldQuit chan struct{}
-	stdinChan  chan byte
-	renderTick <-chan time.Time
+	screen tcell.Screen
+	quit   chan struct{}
 }
 
 func NewApp(cfg *Config) *App {
+	screen, err := tcell.NewScreen()
+	if err != nil {
+		panic(err)
+	}
+	if err := screen.Init(); err != nil {
+		panic(err)
+	}
+	screen.Clear()
+
 	client := NewHTTPClient(cfg.ServerAddr)
-	ws := NewWSClient(cfg.ServerAddr)
+	ws := NewWSClient()
 
 	return &App{
 		cfg:        cfg,
@@ -328,13 +344,22 @@ func NewApp(cfg *Config) *App {
 		ws:         ws,
 		state:      StateBrowse,
 		nodes:      []Node{},
-		shouldQuit: make(chan struct{}),
-		stdinChan:  make(chan byte, 100),
-		renderTick: time.NewTicker(33 * time.Millisecond).C,
+		statusTime: time.Now(),
+		errTime:    time.Now(),
+		screen:     screen,
+		quit:       make(chan struct{}),
 	}
 }
 
-// =========== Registration ===========
+func (a *App) cleanup() {
+	if a.callTimer != nil {
+		a.callTimer.Stop()
+	}
+	if a.ws != nil {
+		a.ws.Close()
+	}
+	a.screen.Fini()
+}
 
 func (a *App) isRegistered() bool {
 	return a.cfg.NodeID != "" && a.cfg.NetworkID != "" && a.cfg.Name != ""
@@ -357,7 +382,6 @@ func (a *App) Register(nodeID, name, networkID string) {
 	if err != nil {
 		a.setError("Registration failed: " + err.Error())
 	} else {
-		a.http.nodeID = registered.ID
 		a.setStatus("Registered as " + registered.Name)
 		go a.fetchNodes()
 		go a.connectWS()
@@ -501,13 +525,15 @@ func (a *App) setIncoming(from, callID string) {
 	a.state = StateIncoming
 }
 
-// =========== WebSocket Handling ===========
-
 func (a *App) connectWS() {
 	if !a.isRegistered() {
 		return
 	}
-	_ = a.ws.Connect(a.cfg.ServerAddr, a.cfg.NodeID)
+	err := a.ws.Connect(a.cfg.ServerAddr, a.cfg.NodeID)
+	if err != nil {
+		a.setError("WS connect failed: " + err.Error())
+		return
+	}
 	go func() {
 		for msg := range a.ws.Messages() {
 			a.handleWS(msg)
@@ -542,8 +568,6 @@ func (a *App) handleWS(msg Message) {
 	}
 }
 
-// =========== Status Management ===========
-
 func (a *App) setStatus(msg string) {
 	a.statusMsg = msg
 	a.statusTime = time.Now().Add(3 * time.Second)
@@ -562,87 +586,164 @@ func (a *App) hasError() bool {
 	return time.Now().Before(a.errTime) && a.errMsg != ""
 }
 
-// =========== Rendering ===========
+// =========== Rendering with tcell ===========
 
-const (
-	colorReset  = "\033[0m"
-	colorRed    = "\033[31m"
-	colorGreen  = "\033[32m"
-	colorYellow = "\033[33m"
-	colorPurple = "\033[35m"
-	colorCyan   = "\033[36m"
-	colorGray   = "\033[90m"
-	colorBold   = "\033[1m"
-)
-
-var (
-	styleTitle   = colorCyan + colorBold
-	styleHeader  = colorPurple
-	styleOnline  = colorGreen
-	styleOffline = colorGray
-	styleSelect  = colorYellow + colorBold
-	styleError   = colorRed
-	styleSuccess = colorGreen
-	styleMuted   = colorGray
-)
-
-func clear() {
-	fmt.Print("\033[2J\033[H")
+func (a *App) drawText(screen tcell.Screen, x, y int, text string, style tcell.Style) {
+	for i, ch := range text {
+		screen.SetContent(x+i, y, ch, nil, style)
+	}
 }
 
-func (a *App) Render() {
-	clear()
-	a.renderHeader()
-	fmt.Println()
-	if a.incoming != nil {
-		a.renderIncoming()
-		fmt.Println()
-	}
-	if a.activeCall != nil && a.state == StateInCall {
-		a.renderActiveCall()
-		fmt.Println()
-	}
-	if !a.isRegistered() {
-		a.renderRegister()
-	} else {
-		a.renderNodeList()
-	}
-	fmt.Println()
-	a.renderFooter()
-}
+func (a *App) render() {
+	screen := a.screen
+	screen.Clear()
 
-func (a *App) renderHeader() {
-	title := styleTitle + " ZeroPhone CLI " + colorReset
-	status := styleMuted + "[Disconnected]" + colorReset
+	_, width := screen.Size()
+	height, _ := screen.Size()
+
+	// Styles (define once at package level, recreate per render since tcell.Style is immutable)
+	titleStyle := tcell.StyleDefault.Foreground(tcell.NewRGBColor(0, 255, 255)).Bold(true) // Cyan
+	headerStyle := tcell.StyleDefault.Foreground(tcell.NewRGBColor(128, 0, 128))           // Purple
+	onlineStyle := tcell.StyleDefault.Foreground(tcell.ColorGreen)
+	offlineStyle := tcell.StyleDefault.Foreground(tcell.ColorGray)
+	selectStyle := tcell.StyleDefault.Foreground(tcell.NewRGBColor(255, 255, 0)).Bold(true) // Yellow
+	errorStyle := tcell.StyleDefault.Foreground(tcell.ColorRed)
+	successStyle := tcell.StyleDefault.Foreground(tcell.ColorGreen)
+	mutedStyle := tcell.StyleDefault.Foreground(tcell.ColorGray)
+	normalStyle := tcell.StyleDefault
+
+	// Header
+	title := " ZeroPhone CLI "
+	status := "[Disconnected]"
 	if a.isRegistered() {
-		status = styleSuccess + "[Online]" + colorReset
+		status = "[Online]"
 	}
-	fmt.Println(" " + title + " " + status)
+	headerText := title + " " + status
+	a.drawText(screen, 2, 0, headerText, titleStyle)
+	separator := strings.Repeat("─", width-2)
+	a.drawText(screen, 2, 1, separator, headerStyle)
+
+	// Incoming call overlay
+	if a.incoming != nil {
+		y := height/2 - 2
+		text := " Incoming Call from " + a.incoming.From + " "
+		x := (width - len(text)) / 2
+		if x < 2 {
+			x = 2
+		}
+		a.drawText(screen, x, y, text, errorStyle)
+		y += 2
+		opt1 := "[a] Answer"
+		opt2 := "[R] Reject"
+		line := "  " + opt1 + "    " + opt2
+		x = (width - len(line)) / 2
+		if x < 2 {
+			x = 2
+		}
+		a.drawText(screen, x, y, line, mutedStyle)
+	}
+
+	// Active call bar
+	if a.activeCall != nil && a.state == StateInCall {
+		y := height - 5
+		text := fmt.Sprintf(" Active Call with %s  %s ", a.activeCall.To, a.formatDuration(a.callSecs))
+		x := (width - len(text)) / 2
+		if x < 2 {
+			x = 2
+		}
+		a.drawText(screen, x, y, text, successStyle)
+		y++
+		a.drawText(screen, 2, y, "  Press [Enter] to end the call", normalStyle)
+	}
+
+	// Main content
+	y := 3
+	if !a.isRegistered() {
+		y = a.renderRegister(screen, width, y, titleStyle, headerStyle, mutedStyle, normalStyle, errorStyle)
+	} else {
+		y = a.renderNodeList(screen, width, y, headerStyle, selectStyle, onlineStyle, offlineStyle, normalStyle)
+	}
+
+	// Footer
+	separator2 := strings.Repeat("─", width-2)
+	a.drawText(screen, 2, height-3, separator2, mutedStyle)
+
+	// Status line
+	if a.hasError() {
+		a.drawText(screen, 2, height-2, " "+a.errMsg+" ", errorStyle)
+	} else if a.hasStatus() {
+		a.drawText(screen, 2, height-2, " "+a.statusMsg+" ", successStyle)
+	}
+
+	// Help + time
+	now := time.Now().Format("15:04:05")
+	help := " [↑↓]Select  [Enter]Call/End  [a]Ans  [R]Rej  [d]Del  [r]Ref  [q]Quit "
+	timeStr := " " + now + " "
+	helpX := 2
+	timeX := width - 2 - len(timeStr)
+	if timeX < helpX+len(help) {
+		timeX = helpX + len(help)
+	}
+	a.drawText(screen, helpX, height-1, help, mutedStyle)
+	a.drawText(screen, timeX, height-1, timeStr, mutedStyle)
+
+	screen.Show()
 }
 
-func (a *App) renderRegister() {
-	fmt.Println(colorYellow + " ╔═══════════════════════════════════════╗ " + colorReset)
-	fmt.Println(colorYellow + " ║          Not Registered               ║ " + colorReset)
-	fmt.Println(colorYellow + " ╚═══════════════════════════════════════╝ " + colorReset)
-	fmt.Println()
-	fmt.Println("  Identity file: " + styleMuted + a.cfg.configPath + colorReset)
-	fmt.Println()
-	fmt.Printf("  %sNetwork ID:%s  %s\n", styleMuted, colorReset, a.cfg.NetworkID)
-	fmt.Printf("  %sNode ID:%s     %s\n", styleMuted, colorReset, a.cfg.NodeID)
-	fmt.Printf("  %sName:%s        %s\n", styleMuted, colorReset, a.cfg.Name)
-	fmt.Println()
-	fmt.Println("  Edit the file or create it with:")
-	fmt.Println()
-	fmt.Println("  Example:")
+func (a *App) renderRegister(screen tcell.Screen, width, startY int, titleStyle, headerStyle, mutedStyle, normalStyle, errorStyle tcell.Style) int {
+	y := startY
+
+	boxText := " Not Registered "
+	boxWidth := len(boxText) + 4
+	boxX := (width - boxWidth) / 2
+	if boxX < 2 {
+		boxX = 2
+	}
+
+	// Top line
+	line := "╔" + strings.Repeat("═", boxWidth-2) + "╗"
+	a.drawText(screen, boxX, y, line, headerStyle)
+	y++
+
+	// Text line
+	inner := "║ " + boxText + " ║"
+	a.drawText(screen, boxX, y, inner, errorStyle)
+	y++
+
+	// Bottom line
+	line = "╚" + strings.Repeat("═", boxWidth-2) + "╝"
+	a.drawText(screen, boxX, y, line, headerStyle)
+	y += 2
+
+	// Config info
+	a.drawText(screen, 2, y, "Identity file: "+a.cfg.configPath, mutedStyle)
+	y += 2
+	a.drawText(screen, 2, y, "Network ID:  "+a.cfg.NetworkID, normalStyle)
+	y++
+	a.drawText(screen, 2, y, "Node ID:     "+a.cfg.NodeID, normalStyle)
+	y++
+	a.drawText(screen, 2, y, "Name:        "+a.cfg.Name, normalStyle)
+	y += 2
+	a.drawText(screen, 2, y, "Edit the file above or use API to register.", mutedStyle)
+	y += 2
+	a.drawText(screen, 2, y, "Example:", mutedStyle)
+	y++
 	example := `  {
     "network_id": "a84ac5c123456789",
     "node_id": "your-zerotier-node-id",
     "name": "Your Name"
   }`
-	fmt.Println(styleMuted + example + colorReset)
+	lines := strings.Split(example, "\n")
+	for _, line := range lines {
+		a.drawText(screen, 2, y, line, mutedStyle)
+		y++
+	}
+
+	return y
 }
 
-func (a *App) renderNodeList() {
+func (a *App) renderNodeList(screen tcell.Screen, width, startY int, headerStyle, selectStyle, onlineStyle, offlineStyle, normalStyle tcell.Style) int {
+	y := startY
 	filtered := a.filterNodes()
 	online := 0
 	for _, n := range filtered {
@@ -651,22 +752,28 @@ func (a *App) renderNodeList() {
 		}
 	}
 
-	header := fmt.Sprintf(" Nodes on %s ", a.cfg.NetworkID)
-	fmt.Println(" " + styleHeader + header + colorReset)
-	fmt.Println()
+	// Header
+	header := " Nodes on " + a.cfg.NetworkID + " "
+	a.drawText(screen, 2, y, header, headerStyle)
+	y += 2
 
 	if len(filtered) == 0 {
-		fmt.Println("  " + styleMuted + "No other nodes discovered" + colorReset)
-		return
+		a.drawText(screen, 2, y, "  No other nodes discovered", normalStyle)
+		return y + 1
 	}
 
-	fmt.Printf("  %s  %-20s  %-20s  %s\n", styleSelect+"▶"+colorReset, "Name", "Node ID", "Status")
-	fmt.Println("  " + strings.Repeat("─", 73))
+	// Table header
+	a.drawText(screen, 2, y, "▶  Name                  Node ID                Status", selectStyle)
+	y++
+	separator := strings.Repeat("─", width-4)
+	a.drawText(screen, 2, y, separator, headerStyle)
+	y++
 
+	// Nodes
 	for i, node := range filtered {
 		sel := "  "
 		if i == a.selectedIdx {
-			sel = styleSelect + "▶" + colorReset
+			sel = "▶"
 		}
 
 		name := truncate(node.Name, 20)
@@ -674,55 +781,25 @@ func (a *App) renderNodeList() {
 
 		var status string
 		if node.Status == "online" {
-			status = styleOnline + "● online" + colorReset
+			status = "● online"
 		} else {
-			status = styleOffline + "○ offline" + colorReset
+			status = "○ offline"
 		}
 
-		fmt.Printf("%s  %-20s  %-20s  %s\n", sel, name, id, status)
+		line := fmt.Sprintf("%s  %-20s  %-20s  %s", sel, name, id, status)
+		style := normalStyle
+		if i == a.selectedIdx {
+			style = selectStyle
+		}
+		a.drawText(screen, 2, y, line, style)
+		y++
 	}
 
-	fmt.Println()
-	summary := fmt.Sprintf("%d total  %s%d online%s  %s%d offline%s",
-		len(filtered),
-		styleSuccess, online, colorReset,
-		styleMuted, len(filtered)-online, colorReset,
-	)
-	fmt.Println("  " + summary)
-}
+	y++
+	summary := fmt.Sprintf("  %d total  %d online  %d offline", len(filtered), online, len(filtered)-online)
+	a.drawText(screen, 2, y, summary, normalStyle)
 
-func (a *App) renderActiveCall() {
-	fmt.Print(" " + styleSuccess)
-	fmt.Printf(" ╔═ Active Call with %s  %s ╗ ", a.activeCall.To, a.formatDuration(a.callSecs))
-	fmt.Println(colorReset)
-	fmt.Println()
-	fmt.Println("  Press [Enter] to end the call")
-}
-
-func (a *App) renderIncoming() {
-	fmt.Print(" " + colorYellow)
-	fmt.Printf(" ╔═ Incoming Call from %s ╗ ", a.incoming.From)
-	fmt.Println(colorReset)
-	fmt.Println()
-	fmt.Printf("  [a] %sAnswer%s    [%sR%s] %sReject%s\n",
-		styleSuccess, colorReset,
-		styleSelect, colorReset,
-		styleError, colorReset,
-	)
-	fmt.Println()
-}
-
-func (a *App) renderFooter() {
-	now := time.Now().Format("15:04:05")
-
-	if a.hasError() {
-		fmt.Println(" " + styleError + a.errMsg + colorReset + " ")
-	} else if a.hasStatus() {
-		fmt.Println(" " + styleSuccess + a.statusMsg + colorReset + " ")
-	}
-
-	help := styleMuted + " [↑↓]Select  [Enter]Call/End  [a]Ans  [R]Rej  [d]Del  [r]Ref  [q]Quit " + colorReset
-	fmt.Println(" " + help + "  " + styleMuted + now + colorReset)
+	return y + 2
 }
 
 func (a *App) formatDuration(s int) string {
@@ -738,114 +815,91 @@ func truncate(s string, n int) string {
 	return s[:n-2] + ".."
 }
 
-// =========== Input Handling ===========
+// =========== Main Loop ===========
 
 func (a *App) Run() {
-	oldState, _ := term.MakeRaw(int(os.Stdin.Fd()))
-	defer term.Restore(int(os.Stdin.Fd()), oldState)
+	defer a.cleanup()
 
-	// Signals
+	// Signal handling
 	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM, syscall.SIGWINCH)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
 		<-sigChan
-		close(a.shouldQuit)
+		close(a.quit)
 	}()
 
-	// Stdin reader
-	go func() {
-		reader := bufio.NewReader(os.Stdin)
-		for {
-			b, err := reader.ReadByte()
-			if err != nil {
-				close(a.stdinChan)
-				return
-			}
-			select {
-			case a.stdinChan <- b:
-			case <-a.shouldQuit:
-				return
-			}
-		}
-	}()
-
-	// Auto-connect
+	// Auto-connect if configured
 	if a.isRegistered() {
 		a.setStatus("Registered as " + a.cfg.Name)
 		go a.fetchNodes()
 		go a.connectWS()
 	}
 
-	// Main loop
+	// Event loop
 	for {
 		select {
-		case <-a.renderTick:
-			a.Render()
+		case <-a.quit:
+			return
 		case msg := <-a.ws.Messages():
 			a.handleWS(msg)
-		case <-a.ws.Closed():
-			// WS closed — could reconnect
-		case b := <-a.stdinChan:
-			a.handleInput(b)
-		case <-a.shouldQuit:
-			clear()
-			os.Exit(0)
+		default:
+			// Poll tcell events
+			event := a.screen.PollEvent()
+			switch ev := event.(type) {
+			case *tcell.EventResize:
+				a.screen.Sync()
+			case *tcell.EventKey:
+				if ev.Key() == tcell.KeyCtrlC || ev.Key() == tcell.KeyEsc {
+					return
+				}
+				a.handleKey(ev)
+			}
+			a.render()
+			// Small sleep to prevent CPU hog
+			time.Sleep(33 * time.Millisecond)
 		}
 	}
 }
 
-func (a *App) handleInput(b byte) {
-	switch b {
-	case 'q':
-		close(a.shouldQuit)
-	case 3: // Ctrl+C
-		close(a.shouldQuit)
-	case 'r':
-		a.fetchNodes()
-	case 13: // Enter
+func (a *App) handleKey(ev *tcell.EventKey) {
+	switch ev.Key() {
+	case tcell.KeyEnter:
 		switch a.state {
 		case StateBrowse:
 			a.callSelected()
 		case StateInCall:
 			a.endCall()
 		}
-	case 'a':
-		if a.state == StateIncoming && a.incoming != nil {
-			a.answerCall(a.incoming.From, a.incoming.CallID)
+	case tcell.KeyUp:
+		filtered := a.filterNodes()
+		if len(filtered) > 0 {
+			a.selectedIdx = (a.selectedIdx - 1 + len(filtered)) % len(filtered)
 		}
-	case 'R':
-		if a.state == StateIncoming && a.incoming != nil {
-			a.rejectCall(a.incoming.From, a.incoming.CallID)
+	case tcell.KeyDown:
+		filtered := a.filterNodes()
+		if len(filtered) > 0 {
+			a.selectedIdx = (a.selectedIdx + 1) % len(filtered)
 		}
-	case 'd':
-		if a.state == StateBrowse {
-			a.DeleteSelectedNode()
+	case tcell.KeyRune:
+		switch ev.Rune() {
+		case 'q':
+			close(a.quit)
+		case 'r':
+			a.fetchNodes()
+		case 'a':
+			if a.state == StateIncoming && a.incoming != nil {
+				a.answerCall(a.incoming.From, a.incoming.CallID)
+			}
+		case 'R':
+			if a.state == StateIncoming && a.incoming != nil {
+				a.rejectCall(a.incoming.From, a.incoming.CallID)
+			}
+		case 'd':
+			if a.state == StateBrowse {
+				a.DeleteSelectedNode()
+			}
 		}
-	case 0x1B: // ESC
-		go func() {
-			b2 := a.readByte()
-			if b2 != '[' {
-				return
-			}
-			b3 := a.readByte()
-			filtered := a.filterNodes()
-			if len(filtered) == 0 {
-				return
-			}
-			switch b3 {
-			case 'A':
-				a.selectedIdx = (a.selectedIdx - 1 + len(filtered)) % len(filtered)
-			case 'B':
-				a.selectedIdx = (a.selectedIdx + 1) % len(filtered)
-			}
-		}()
 	}
-}
-
-func (a *App) readByte() byte {
-	var b [1]byte
-	os.Stdin.Read(b[:])
-	return b[0]
 }
 
 // =========== Entry ===========
